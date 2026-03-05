@@ -1,0 +1,10 @@
+streamlit
+pandas
+openai
+nltk
+scikit-learn
+beautifulsoup4
+requests
+python-dotenv
+selenium
+webdriver-manager
