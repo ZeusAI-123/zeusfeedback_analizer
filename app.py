@@ -758,104 +758,205 @@ def json_mine(html_src: str) -> list:
 
 # ── Domain-specific scrapers ──────────────────────────────
 
-def scrape_quora(url: str):
+def _quora_extract_from_page(resp_text: str, seen: set, fbs: list, names: list, dates: list, min_len=150):
     """
-    Quora scraper — no Selenium required.
-
-    Quora blocks headless browsers on web pages but their AMP pages
-    (amp.quora.com) and sitemap/answer pages return full static HTML
-    including complete answer text without any collapsing.
-
-    Strategy (tried in order):
-    1. AMP URL — amp.quora.com gives full expanded answers as static HTML
-    2. JSON-LD mining from the standard page (some answers appear in structured data)
-    3. Mobile UA request to www.quora.com (sometimes bypasses collapse)
-    4. Direct answer URL if a single /answer/ URL is provided
-    5. Search redirect with clear guidance if all fail
+    Extract answer content from a fetched Quora page HTML.
+    Tries JSON-LD structured data first (most reliable, always full text),
+    then generic block extraction, then raw JSON mining.
+    Returns number of new items added.
     """
-    fbs, names, dates = [], [], []; seen = set()
-
-    # Normalise: if /topic/ URL, convert to search
-    base_urls = [url]
-    if '/topic/' in url:
-        slug_m = re.search(r'/topic/([^/?#]+)', url)
-        if slug_m:
-            slug = slug_m.group(1)
-            q = re.sub(r'[-_%]',' ', slug).strip()
-            qe = requests.utils.quote(q)
-            base_urls = [
-                f"https://www.quora.com/search?q={qe}&type=answer",
-                url,
-            ]
+    added = 0
+    soup = BeautifulSoup(resp_text, 'html.parser')
 
     def _add(text, name='', date=''):
-        cl = clean_text(text)
-        if is_junk(cl) or len(cl) < 150: return
+        nonlocal added
+        cl = clean_text(str(text))
+        if is_junk(cl) or len(cl) < min_len: return
         if is_truncated(cl): return
         k = cl[:120].lower()
         if k in seen: return
         seen.add(k); fbs.append(cl); names.append(name); dates.append(date)
+        added += 1
 
-    for src_url in base_urls:
-        # ── Attempt 1: AMP version ──────────────────────────
-        # amp.quora.com serves full static HTML with complete answer text
-        amp_url = src_url.replace('www.quora.com', 'amp.quora.com').replace('quora.com', 'amp.quora.com')
-        if not amp_url.startswith('https://amp.'): amp_url = src_url  # skip if already non-www
+    # Strategy A: JSON-LD structured data — Quora embeds full answer text here
+    # Works on individual question pages (/What-is-X) and some search results
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string or '')
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                # QAPage schema: mainEntity.acceptedAnswer / suggestedAnswer
+                main = item.get('mainEntity', item)
+                for key in ('acceptedAnswer', 'suggestedAnswer', 'answer'):
+                    ans_list = main.get(key, [])
+                    if isinstance(ans_list, dict): ans_list = [ans_list]
+                    for a in (ans_list or []):
+                        txt = a.get('text', '') or a.get('description', '')
+                        if txt and len(txt) > min_len:
+                            author = a.get('author', {})
+                            aname = author.get('name','') if isinstance(author, dict) else str(author)
+                            _add(txt, aname)
+                # ItemList schema (search results page)
+                for item2 in item.get('itemListElement', []):
+                    item3 = item2.get('item', item2)
+                    for key in ('acceptedAnswer','suggestedAnswer','answer','text','description'):
+                        val = item3.get(key, '')
+                        if isinstance(val, str) and len(val) > min_len:
+                            _add(val)
+                        elif isinstance(val, dict):
+                            txt = val.get('text','') or val.get('description','')
+                            if txt and len(txt) > min_len: _add(txt)
+        except: pass
 
-        for try_url in [amp_url, src_url]:
+    # Strategy B: Embedded __NEXT_DATA__ or window.__reactProps JSON bundles
+    # Many modern Quora pages embed full answer text in page JS
+    for script in soup.find_all('script'):
+        src_txt = script.string or ''
+        if len(src_txt) < 200: continue
+        # Look for answer text fields in embedded JSON
+        for m in re.finditer(r'"(?:qtext|body|content|answerText|fullContent)"\s*:\s*"([^"]{' + str(min_len) + r',})"', src_txt):
+            raw = m.group(1).replace('\\n', ' ').replace('\\t', ' ').replace('\\"', '"')
+            raw = re.sub(r'\\u[0-9a-fA-F]{4}', ' ', raw)
+            _add(raw)
+
+    # Strategy C: Generic HTML block extraction
+    if added < 3:
+        blocks = extract_blocks_generic(soup, min_len=min_len)
+        for b in blocks: _add(b['text'], b['name'], b['date'])
+
+    # Strategy D: Raw JSON string mining from entire page source
+    if added < 3:
+        for b in json_mine(resp_text):
+            if len(b['text']) >= min_len: _add(b['text'])
+
+    return added
+
+
+def _find_quora_answer_urls_via_ddg(query: str, max_results=15) -> list:
+    """
+    Use DuckDuckGo HTML search (no API key needed) to find real Quora answer
+    URLs for a given query. Returns list of quora.com URLs.
+    """
+    answer_urls = []
+    try:
+        search_q = requests.utils.quote(f"site:quora.com {query} review experience")
+        ddg_url = f"https://html.duckduckgo.com/html/?q={search_q}"
+        resp = _fetch(ddg_url, timeout=12, mobile=False)
+        if not resp: return []
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        # DuckDuckGo HTML results: links in <a class="result__a">
+        for a in soup.find_all('a', class_=re.compile(r'result__a|result__url', re.I)):
+            href = a.get('href', '')
+            # DDG wraps URLs — extract actual URL
+            if 'uddg=' in href:
+                m = re.search(r'uddg=([^&]+)', href)
+                if m: href = requests.utils.unquote(m.group(1))
+            if 'quora.com' in href and len(href) > 20:
+                # Prefer question/answer URLs, skip topic/profile pages
+                if any(x in href for x in ['/answer/', '/What-', '/How-', '/Why-', '/Is-', '/Does-', '/Can-', '/Are-', '/Will-']):
+                    answer_urls.append(href.split('?')[0])
+                elif '/topic/' not in href and '/profile/' not in href and '/search' not in href:
+                    answer_urls.append(href.split('?')[0])
+        # Deduplicate
+        answer_urls = list(dict.fromkeys(answer_urls))[:max_results]
+    except Exception:
+        pass
+    return answer_urls
+
+
+def scrape_quora(url: str):
+    """
+    Quora scraper — 100% requests+BS4, no Selenium.
+
+    Quora's /topic/ pages always require login — they are a dead end.
+    The correct approach is:
+
+    Step 1: If /topic/ URL → extract the topic name and build a search query
+    Step 2: Use DuckDuckGo (no API key) to find real Quora answer URLs
+            for that topic (e.g. quora.com/What-is-X/answer/Person)
+    Step 3: Fetch each answer URL directly — individual answer pages
+            embed full answer text in JSON-LD structured data (no login needed)
+    Step 4: Also try AMP versions of those URLs (amp.quora.com/...)
+    Step 5: If a direct /answer/ or question URL was provided, use it directly
+    Step 6: Clear, actionable error message if everything fails
+    """
+    fbs, names, dates = [], [], []
+    seen: set = set()
+
+    # ── Derive search query from the URL ──────────────────────
+    query = ''
+    is_topic_url = '/topic/' in url
+    is_answer_url = '/answer/' in url
+    is_question_url = bool(re.search(r'quora\.com/[A-Z][^/]+$|quora\.com/[A-Z][^/]+-\d+$', url))
+
+    if is_topic_url:
+        slug_m = re.search(r'/topic/([^/?#]+)', url)
+        if slug_m:
+            query = re.sub(r'[-_%+]', ' ', requests.utils.unquote(slug_m.group(1))).strip()
+    elif not is_answer_url:
+        # Extract query from search URL or page slug
+        q_m = re.search(r'[?&]q=([^&]+)', url)
+        if q_m:
+            query = requests.utils.unquote(q_m.group(1)).replace('+', ' ').replace('%20', ' ').strip()
+        else:
+            path = re.sub(r'https?://(www\.)?quora\.com', '', url).strip('/')
+            query = re.sub(r'[-_]', ' ', path.split('/')[0])[:60]
+
+    # ── Step 1: Direct answer/question URL ────────────────────
+    if is_answer_url or is_question_url:
+        for try_url in [url, url.replace('www.quora.com', 'amp.quora.com')]:
             resp = _fetch(try_url, timeout=15, mobile=True)
-            if not resp: continue
-            soup = BeautifulSoup(resp.text, 'html.parser')
-
-            # Quora AMP: answers in <div class="Answer"> or similar
-            # Also try JSON-LD structured data first (most reliable)
-            for script in soup.find_all('script', type='application/ld+json'):
-                try:
-                    data = json.loads(script.string or '')
-                    items = data if isinstance(data, list) else [data]
-                    for item in items:
-                        # Review/QAPage schema
-                        for key in ('acceptedAnswer','suggestedAnswer','answer'):
-                            ans = item.get(key, [])
-                            if isinstance(ans, dict): ans = [ans]
-                            for a in ans:
-                                txt = a.get('text','') or a.get('description','')
-                                if txt and len(txt) > 150:
-                                    _add(txt, a.get('author',{}).get('name','') if isinstance(a.get('author'),dict) else '')
-                except: pass
-
-            # Generic block extraction — works on AMP pages
-            blocks = extract_blocks_generic(soup, min_len=150)
-            for b in blocks: _add(b['text'], b['name'], b['date'])
-
-            # JSON mining from page source
-            for b in json_mine(resp.text):
-                if len(b['text']) >= 150: _add(b['text'])
-
-            if len(fbs) >= 5: break
-
-        # ── Attempt 2: Individual answer pages (if answer URL provided) ──
-        if '/answer/' in src_url and len(fbs) < 3:
-            resp = _fetch(src_url, timeout=15, mobile=False)
             if resp:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                # Full answer text often in a <div> with data attributes
-                for el in soup.find_all('div', attrs={'data-testid': True}):
-                    raw = el.get_text(' ', strip=True)
-                    if len(raw) > 200: _add(raw)
-                for b in json_mine(resp.text):
-                    if len(b['text']) >= 150: _add(b['text'])
+                _quora_extract_from_page(resp.text, seen, fbs, names, dates, min_len=150)
+            if len(fbs) >= 3: break
 
-        if len(fbs) >= 5: break
+    # ── Step 2: DuckDuckGo → find real answer URLs → fetch each ──
+    if len(fbs) < 5 and query:
+        answer_urls = _find_quora_answer_urls_via_ddg(query, max_results=20)
+        for ans_url in answer_urls:
+            if len(fbs) >= 30: break
+            # Try AMP first (most reliable for full text)
+            amp_url = ans_url.replace('www.quora.com', 'amp.quora.com').replace('quora.com', 'amp.quora.com')
+            fetched = False
+            for try_url in [amp_url, ans_url]:
+                resp = _fetch(try_url, timeout=12, mobile=True)
+                if resp:
+                    before = len(fbs)
+                    _quora_extract_from_page(resp.text, seen, fbs, names, dates, min_len=150)
+                    if len(fbs) > before: fetched = True; break
+            time.sleep(0.3)  # polite delay between answer fetches
+
+    # ── Step 3: Try Quora search page via AMP ─────────────────
+    if len(fbs) < 5 and query:
+        qe = requests.utils.quote(query)
+        search_urls = [
+            f"https://amp.quora.com/search?q={qe}&type=answer",
+            f"https://www.quora.com/search?q={qe}&type=answer",
+            f"https://www.quora.com/search?q={qe}+review&type=answer",
+        ]
+        for s_url in search_urls:
+            resp = _fetch(s_url, timeout=12, mobile=True)
+            if resp:
+                _quora_extract_from_page(resp.text, seen, fbs, names, dates, min_len=150)
+            if len(fbs) >= 5: break
+            time.sleep(0.3)
 
     if not fbs:
+        # Build helpful error with exact clickable URLs the user can try
+        q_safe = query or 'barbeque nation review'
+        qe = requests.utils.quote(q_safe)
         return [], [], [], (
-            "⚠️ Quora requires login to view answers on this page.\n\n"
-            "**Best options:**\n"
-            "1. Copy the answers manually → paste into a CSV → use CSV Upload tab\n"
-            "2. Use a direct answer URL: `quora.com/What-is-X/answer/Person-Name`\n"
-            "3. Try: `quora.com/search?q=your+topic&type=answer`"
+            f"⚠️ **Quora /topic/ pages require login** — the scraper cannot access them.\n\n"
+            f"**Option 1 — Paste one of these URLs instead** (these work without login):\n"
+            f"- `https://www.quora.com/search?q={qe}&type=answer`\n"
+            f"- Find a specific answer: open Quora → click any answer → copy that URL\n"
+            f"  (e.g. `quora.com/What-is-your-review-of-Barbeque-Nation/answer/John-Doe`)\n\n"
+            f"**Option 2 — CSV Upload (fastest):**\n"
+            f"Copy answers from Quora → paste into a spreadsheet → upload via CSV tab.\n\n"
+            f"**Option 3 — Direct question URL:**\n"
+            f"Use the URL of the Quora question page itself, not the topic page."
         )
+
     return fbs[:200], names[:200], dates[:200], None
 
 
