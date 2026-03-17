@@ -1461,7 +1461,7 @@ with st.sidebar:
 st.markdown('<div class="hero-title">⚡ ZEUS FEEDBACK ANALYZER</div>', unsafe_allow_html=True)
 st.markdown('<div class="hero-sub">Customer Intelligence · Topic Modeling · Real Sentiment · Streamlit Cloud Ready</div>', unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📄 CSV Upload","🔗 URL Scraper","📝 Paste Text","📊 Results","🗄️ History"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📄 CSV Upload","🔗 URL Scraper","🔵 Quora","📊 Results","🗄️ History"])
 
 # ══════════════════════════════════════════════════════════════
 # TAB 1 — CSV UPLOAD
@@ -1695,10 +1695,241 @@ with tab2:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════
-# TAB 3 — RESULTS
+# ══════════════════════════════════════════════════════════════
+# TAB 3 — QUORA FEEDBACK (dedicated paste + SerpAPI input)
 # ══════════════════════════════════════════════════════════════
 
 with tab3:
+    st.markdown('<div class="card"><div class="card-title">🔵 Quora Feedback</div>', unsafe_allow_html=True)
+
+    # ── Why direct scraping doesn't work ──────────────────────
+    st.markdown("""
+<div style="background:rgba(0,188,212,0.06);border:1px solid rgba(0,188,212,0.25);border-radius:10px;padding:1rem 1.4rem;margin-bottom:1.2rem;">
+  <div style="font-family:'Space Mono',monospace;font-size:0.68rem;color:#00bcd4;letter-spacing:2px;text-transform:uppercase;margin-bottom:0.5rem;">ℹ️ About Quora Scraping</div>
+  <div style="font-family:'Space Mono',monospace;font-size:0.65rem;color:#888;line-height:1.9;">
+    Quora blocks all cloud server IPs (AWS/GCP/Azure) — direct scraping is impossible from Streamlit Cloud.<br>
+    Use <strong style="color:#f9a825;">Method 1</strong> (SerpAPI — recommended) or <strong style="color:#f9a825;">Method 2</strong> (paste answers directly).
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    q_method = st.radio(
+        "Choose input method",
+        ["🔑 Method 1 — SerpAPI (automated, needs free API key)", "📋 Method 2 — Paste answers directly (no setup)"],
+        label_visibility="collapsed"
+    )
+
+    # ════════════════════════════════════════════════════════
+    # METHOD 1 — SerpAPI
+    # Free tier: 100 searches/month at serpapi.com
+    # Returns Google search results for site:quora.com queries
+    # which contain full snippets of Quora answer text
+    # ════════════════════════════════════════════════════════
+    if "Method 1" in q_method:
+        st.markdown("""
+<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:1rem 1.4rem;margin-bottom:1rem;">
+  <div style="font-size:0.85rem;color:#ddd;line-height:1.8;">
+    <strong style="color:#f9a825;">Get a free SerpAPI key (100 searches/month):</strong><br>
+    1. Go to <code>serpapi.com</code> → Sign up free<br>
+    2. Copy your API key from the dashboard<br>
+    3. Add it to Streamlit secrets as <code>SERPAPI_KEY</code><br>
+       &nbsp;&nbsp;&nbsp;<em>Or paste it below for this session only</em>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        serp_key = os.getenv("SERPAPI_KEY", "")
+        if not serp_key:
+            serp_key = st.text_input(
+                "SerpAPI Key (session only, not saved)",
+                type="password",
+                placeholder="Paste your free SerpAPI key here..."
+            )
+
+        q_query = st.text_input(
+            "What to search for on Quora",
+            placeholder="e.g. Barbeque Nation review experience",
+            value=""
+        )
+        q_pages = st.slider("Number of search pages (10 results each)", 1, 5, 2)
+        q_notes = st.text_input("Session notes (optional)", placeholder="e.g. Quora Q1 2025", key="qn1")
+
+        if st.button("🔍 Fetch Quora Answers via SerpAPI", key="serp_btn"):
+            if not serp_key:
+                st.error("❌ Enter a SerpAPI key above, or get a free one at serpapi.com")
+            elif not q_query.strip():
+                st.error("❌ Enter a search query")
+            else:
+                fbs, names, dates = [], [], []
+                seen = set()
+                nm = st.session_state.user_name or "USER"
+                sid, uid8 = gen_sid(nm)
+                st.session_state.session_id = sid; st.session_state.short_uuid = uid8
+
+                progress = st.progress(0)
+                status = st.empty()
+
+                for page_num in range(q_pages):
+                    status.markdown(f'<p class="pulse" style="color:#f9a825;font-family:Space Mono,monospace;font-size:0.8rem;">🔍 Fetching page {page_num+1}/{q_pages}...</p>', unsafe_allow_html=True)
+                    try:
+                        params = {
+                            "engine": "google",
+                            "q": f"site:quora.com {q_query}",
+                            "api_key": serp_key,
+                            "num": "10",
+                            "start": str(page_num * 10),
+                            "hl": "en"
+                        }
+                        resp = requests.get("https://serpapi.com/search", params=params, timeout=15)
+                        if resp.status_code != 200:
+                            st.warning(f"SerpAPI error on page {page_num+1}: HTTP {resp.status_code}")
+                            break
+
+                        data = resp.json()
+                        results = data.get("organic_results", [])
+
+                        for r in results:
+                            # Skip topic/profile/search pages
+                            link = r.get("link", "")
+                            if any(x in link for x in ["/topic/", "/profile/", "/search"]):
+                                continue
+
+                            # Title contains question + author
+                            title = r.get("title", "")
+                            name = ""
+                            by_m = re.search(r"(?:answer(?:ed)? by|by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", title, re.I)
+                            if by_m: name = by_m.group(1).strip()
+
+                            # snippet = the answer preview text (usually 200-400 chars)
+                            snippet = r.get("snippet", "") or r.get("snippet_highlighted_words", "")
+                            if isinstance(snippet, list): snippet = " ".join(snippet)
+
+                            # Also check rich_snippet / about_this_result
+                            for key in ("rich_snippet", "about_this_result"):
+                                extra = r.get(key, {})
+                                if isinstance(extra, dict):
+                                    for v in extra.values():
+                                        if isinstance(v, str) and len(v) > 80:
+                                            snippet = (snippet + " " + v).strip()
+
+                            if not snippet or len(snippet.strip()) < 60:
+                                continue
+
+                            # Clean snippet
+                            cl = clean_text(snippet.strip())
+                            cl = re.sub(r"^\d+\s+(?:answers?|votes?)\s*[·•]\s*", "", cl, flags=re.I)
+                            cl = re.sub(r"^Quora\s*[·•]\s*", "", cl, flags=re.I)
+                            cl = re.sub(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\s*[·•]?\s*", "", cl, flags=re.I)
+
+                            if is_junk(cl) or len(cl) < 60: continue
+                            k = cl[:120].lower()
+                            if k in seen: continue
+                            seen.add(k)
+                            fbs.append(cl); names.append(name); dates.append("")
+
+                        progress.progress((page_num + 1) / q_pages)
+                        time.sleep(0.5)
+
+                    except Exception as e:
+                        st.warning(f"⚠️ Error on page {page_num+1}: {e}")
+                        break
+
+                status.empty(); progress.empty()
+
+                if fbs:
+                    st.success(f"✅ Found **{len(fbs)}** Quora answer snippets")
+                    with st.spinner("Analyzing..."):
+                        results_df = build_results(fbs, "Quora", names, dates, mode='full')
+                    if not results_df.empty:
+                        st.session_state.results_df = results_df; st.session_state.analyzed = True
+                        saved, skipped = save_entries(sid, results_df)
+                        save_session(sid, nm, uid8, "Quora", saved, q_notes)
+                        if 'Sentiment' in results_df.columns:
+                            sc = results_df['Sentiment'].value_counts()
+                            st.info("🎯 Sentiment: " + " · ".join([f"**{s}**: {c}" for s,c in sc.items()]))
+                        msg = f"✅ **{len(results_df):,}** results · **{saved:,}** new saved → **📊 Results**"
+                        if skipped > 0: msg += f" ({skipped} duplicates skipped)"
+                        st.success(msg)
+                    else:
+                        st.error("❌ No processable feedback found in those results.")
+                else:
+                    st.warning("⚠️ No Quora answers found. Try a different search query.")
+
+    # ════════════════════════════════════════════════════════
+    # METHOD 2 — Direct paste
+    # User copies answers from Quora manually and pastes here
+    # Supports bulk paste: one answer per line OR full paragraphs
+    # ════════════════════════════════════════════════════════
+    else:
+        st.markdown("""
+<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:1rem 1.4rem;margin-bottom:1rem;">
+  <div style="font-size:0.85rem;color:#ddd;line-height:1.8;">
+    <strong style="color:#f9a825;">How to paste Quora answers:</strong><br>
+    1. Open Quora → search for your topic<br>
+    2. Open each answer → Select All text → Copy<br>
+    3. Paste below (one answer per block, separated by blank lines)<br>
+    4. Click Analyze
+  </div>
+</div>""", unsafe_allow_html=True)
+
+        pasted_text = st.text_area(
+            "Paste Quora answers here",
+            placeholder="Paste Quora answers here. Separate multiple answers with a blank line.\n\nExample:\nI visited Barbeque Nation last week — the experience was amazing...\n\nService was disappointing, we waited 40 minutes...",
+            height=300,
+            label_visibility="collapsed"
+        )
+        paste_notes = st.text_input("Session notes (optional)", placeholder="e.g. Quora answers March 2025", key="qn2")
+
+        if st.button("⚡ Analyze Pasted Quora Text", key="paste_btn"):
+            if not pasted_text.strip():
+                st.error("❌ Please paste some Quora answer text above.")
+            else:
+                nm = st.session_state.user_name or "USER"
+                sid, uid8 = gen_sid(nm)
+                st.session_state.session_id = sid; st.session_state.short_uuid = uid8
+
+                # Split into individual answers by blank lines
+                raw_blocks = re.split(r'\n\s*\n', pasted_text.strip())
+                fbs, names, dates = [], [], []
+                seen = set()
+
+                for block in raw_blocks:
+                    block = block.strip()
+                    if not block or len(block) < 40: continue
+                    # Clean common Quora UI artifacts
+                    block = re.sub(r'^\d+\s*(upvote|share|comment|follow|answer)s?\b.*', '', block, flags=re.I|re.M)
+                    block = re.sub(r'(\d+[Kk]?\s*upvotes?|\d+[Kk]?\s*views?|\d+[Kk]?\s*shares?)\s*', '', block, flags=re.I)
+                    block = block.strip()
+                    if is_junk(block) or len(block) < 60: continue
+                    k = block[:120].lower()
+                    if k in seen: continue
+                    seen.add(k)
+                    fbs.append(clean_text(block))
+                    names.append(''); dates.append('')
+
+                if not fbs:
+                    st.error("❌ No usable text found. Make sure you've pasted actual answer content.")
+                else:
+                    st.success(f"✅ Parsed **{len(fbs)}** answer block(s)")
+                    with st.spinner("Analyzing sentiment, topics, and generating AI suggestions..."):
+                        results_df = build_results(fbs, "Quora", names, dates, mode='full')
+                    if not results_df.empty:
+                        st.session_state.results_df = results_df; st.session_state.analyzed = True
+                        saved, skipped = save_entries(sid, results_df)
+                        save_session(sid, nm, uid8, "Quora", saved, paste_notes)
+                        if 'Sentiment' in results_df.columns:
+                            sc = results_df['Sentiment'].value_counts()
+                            st.info("🎯 Sentiment: " + " · ".join([f"**{s}**: {c}" for s,c in sc.items()]))
+                        msg = f"✅ **{len(results_df):,}** entries analyzed · **{saved:,}** saved → **📊 Results**"
+                        if skipped > 0: msg += f" ({skipped} duplicates skipped)"
+                        st.success(msg)
+                    else:
+                        st.error("❌ Could not process the pasted text.")
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# TAB 4 — RESULTS
+# ══════════════════════════════════════════════════════════════
+
+with tab4:
     if not st.session_state.analyzed or st.session_state.results_df is None:
         st.markdown("""<div style="text-align:center;padding:4rem;"><div style="font-size:4rem;">📭</div>
 <div style="font-family:'Space Mono',monospace;font-size:0.9rem;color:#555;letter-spacing:2px;text-transform:uppercase;margin-top:1rem;">No results yet</div>
@@ -1820,10 +2051,10 @@ with tab3:
             st.session_state.session_id = None; st.session_state.short_uuid = None; st.rerun()
 
 # ══════════════════════════════════════════════════════════════
-# TAB 4 — HISTORY
+# TAB 5 — HISTORY
 # ══════════════════════════════════════════════════════════════
 
-with tab4:
+with tab5:
     st.markdown('<div class="card-title" style="font-family:Space Mono,monospace;font-size:0.75rem;letter-spacing:3px;text-transform:uppercase;color:#f9a825;">🗄️ Session History</div>', unsafe_allow_html=True)
     st.info("ℹ️ On Streamlit Cloud, session history persists within the same app instance. For permanent storage across deployments, connect a PostgreSQL database via `st.connection`.", icon="☁️")
     sessions_df = get_all_sessions()
