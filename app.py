@@ -1519,6 +1519,62 @@ with tab1:
 # TAB 2 — URL SCRAPER
 # ══════════════════════════════════════════════════════════════
 
+def _url_preflight_check(url: str):
+    """
+    Instantly check a URL before scraping and return (is_blocked, warning_html).
+    Detects known dead-end URL patterns that will never return data.
+    Returns None if URL looks fine.
+    """
+    if not url: return None
+    url_l = url.lower()
+
+    # ── Quora /topic/ page ────────────────────────────────────
+    if 'quora.com/topic/' in url_l:
+        slug_m = re.search(r'/topic/([^/?#]+)', url, re.I)
+        topic = slug_m.group(1).replace('-', ' ').replace('%20', ' ').strip() if slug_m else 'your topic'
+        q_enc = requests.utils.quote(topic)
+        return f"""
+<div style="background:rgba(233,30,99,0.08);border:1px solid rgba(233,30,99,0.5);border-radius:12px;padding:1.2rem 1.5rem;margin-bottom:1rem;">
+  <div style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#e91e63;letter-spacing:2px;text-transform:uppercase;margin-bottom:0.8rem;">⛔ Quora /topic/ pages always require login</div>
+  <div style="font-size:0.88rem;color:#ddd;line-height:1.9;">
+    Quora topic feeds (<code style="background:rgba(255,255,255,0.08);padding:1px 6px;border-radius:4px;">/topic/...</code>) are login-walled — the scraper cannot access them from Streamlit Cloud.<br><br>
+    <strong style="color:#f9a825;">✅ Use one of these instead:</strong><br><br>
+    <strong>Option 1 — Search URL (copy & paste this):</strong><br>
+    <code style="background:rgba(249,168,37,0.1);border:1px solid rgba(249,168,37,0.3);border-radius:6px;padding:4px 10px;font-size:0.78rem;display:inline-block;margin:4px 0;">https://www.quora.com/search?q={q_enc}+review&type=answer</code><br><br>
+    <strong>Option 2 — Direct answer URL:</strong><br>
+    Open Quora → click any answer → copy the URL from your browser.<br>
+    It looks like: <code style="background:rgba(255,255,255,0.08);padding:1px 6px;border-radius:4px;">quora.com/What-is-your-review-of-{slug_m.group(1) if slug_m else 'Topic'}/answer/Name</code><br><br>
+    <strong>Option 3 — CSV Upload (fastest & most reliable):</strong><br>
+    Copy Quora answers → paste into Excel/Sheets → export as CSV → use <strong>📄 CSV Upload</strong> tab.
+  </div>
+</div>"""
+
+    # ── Quora /profile/ page ──────────────────────────────────
+    if 'quora.com/profile/' in url_l:
+        return """<div style="background:rgba(233,30,99,0.08);border:1px solid rgba(233,30,99,0.5);border-radius:12px;padding:1.2rem 1.5rem;margin-bottom:1rem;">
+  <div style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#e91e63;letter-spacing:2px;text-transform:uppercase;margin-bottom:0.6rem;">⛔ Quora profile pages require login</div>
+  <div style="font-size:0.88rem;color:#ddd;">Use a direct question or answer URL instead: <code>quora.com/Question-text/answer/Person-name</code></div>
+</div>"""
+
+    # ── Generic login wall patterns ───────────────────────────
+    login_patterns = [
+        ('linkedin.com',    'LinkedIn requires login for all pages.'),
+        ('facebook.com',    'Facebook requires login.'),
+        ('instagram.com',   'Instagram requires login.'),
+        ('twitter.com/i/',  'Twitter/X requires login for this URL type.'),
+        ('x.com/i/',        'X (Twitter) requires login for this URL type.'),
+        ('glassdoor.com/Interview/', 'Glassdoor interview pages require login.'),
+    ]
+    for pattern, msg in login_patterns:
+        if pattern in url_l:
+            return f"""<div style="background:rgba(233,30,99,0.08);border:1px solid rgba(233,30,99,0.5);border-radius:12px;padding:1rem 1.4rem;margin-bottom:1rem;">
+  <div style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#e91e63;margin-bottom:0.4rem;">⛔ Login required</div>
+  <div style="font-size:0.85rem;color:#ddd;">{msg} Copy content manually → use CSV Upload tab.</div>
+</div>"""
+
+    return None  # URL looks fine, proceed
+
+
 with tab2:
     st.markdown('<div class="card"><div class="card-title">🌐 Scrape from URL</div>', unsafe_allow_html=True)
     c1, c2 = st.columns([3,1])
@@ -1526,57 +1582,104 @@ with tab2:
     url_input = st.text_input("Paste URL", placeholder="https://www.trustpilot.com/review/...", label_visibility="collapsed")
     multi_urls_text = ""
     if multi_mode: multi_urls_text = st.text_area("One URL per line", placeholder="https://...\nhttps://...", height=100, label_visibility="collapsed")
+
+    # ── Live URL preflight warning (shows instantly as user types) ──
+    _check_url = url_input.strip()
+    if _check_url:
+        _preflight = _url_preflight_check(_check_url)
+        if _preflight:
+            st.markdown(_preflight, unsafe_allow_html=True)
+
     notes_url = st.text_input("Session notes", placeholder="e.g. Competitor analysis", key="nu")
 
-    # Cloud scraping info box
-    st.markdown("""<div style="background:rgba(249,168,37,0.06);border:1px solid rgba(249,168,37,0.25);border-radius:10px;padding:0.8rem 1.2rem;margin-bottom:1rem;">
-<div style="font-family:'Space Mono',monospace;font-size:0.68rem;color:#f9a825;letter-spacing:1px;margin-bottom:0.4rem;">ℹ️ CLOUD SCRAPER INFO</div>
-<div style="font-family:'Space Mono',monospace;font-size:0.65rem;color:#888;line-height:1.8;">
-Quora → AMP pages + JSON-LD (full answer text, no truncation)<br>
-Reddit → old.reddit.com static HTML<br>
-Trustpilot / TripAdvisor / Amazon → paginated static pages<br>
-Zomato → mobile web + internal JSON API<br>
-Sites requiring login → use CSV Upload instead
-</div></div>""", unsafe_allow_html=True)
+    # ── Site capability reference ────────────────────────────
+    with st.expander("ℹ️ What can be scraped from Streamlit Cloud?", expanded=False):
+        st.markdown("""
+| Source | Works? | Notes |
+|--------|--------|-------|
+| **Quora** — direct answer/question URL | ✅ | e.g. `quora.com/Question/answer/Name` |
+| **Quora** — /topic/ or /profile/ page | ❌ | Login required — use CSV Upload |
+| **Reddit** | ✅ | Uses old.reddit.com static HTML |
+| **Trustpilot** | ✅ | Paginated static pages |
+| **Amazon Reviews** | ✅ | Product review pages |
+| **TripAdvisor** | ✅ | JSON-LD + paginated HTML |
+| **Zomato** | ✅ | Mobile web + JSON API |
+| **Glassdoor** | ⚠️ | Best-effort, may be blocked |
+| **G2 / Capterra** | ✅ | Paginated static HTML |
+| **Any public URL** | ⚠️ | Works if no login required |
+""")
 
     if st.button("🔍 Scrape & Analyze", key="url_btn"):
         urls = []
-        if multi_mode and multi_urls_text.strip(): urls = [u.strip() for u in multi_urls_text.strip().split('\n') if u.strip().startswith('http')]
-        elif url_input.strip(): urls = [url_input.strip()]
-        if not urls: st.warning("⚠️ Enter at least one valid URL.")
+        if multi_mode and multi_urls_text.strip():
+            urls = [u.strip() for u in multi_urls_text.strip().split('\n') if u.strip().startswith('http')]
+        elif url_input.strip():
+            urls = [url_input.strip()]
+        if not urls:
+            st.warning("⚠️ Enter at least one valid URL.")
         else:
+            # Pre-scrape check — block known dead-end URLs immediately
+            blocked_urls = []
+            valid_urls = []
+            for u in urls:
+                pf = _url_preflight_check(u)
+                if pf:
+                    blocked_urls.append((u, pf))
+                else:
+                    valid_urls.append(u)
+
+            # Show blocks for bad URLs
+            for bad_url, pf_html in blocked_urls:
+                st.markdown(pf_html, unsafe_allow_html=True)
+
+            if not valid_urls:
+                st.stop()
+
             nm = st.session_state.user_name or "USER"
-            sid, uid8 = gen_sid(nm); st.session_state.session_id = sid; st.session_state.short_uuid = uid8
+            sid, uid8 = gen_sid(nm)
+            st.session_state.session_id = sid; st.session_state.short_uuid = uid8
             all_fb, all_n, all_d, all_s = [], [], [], []
-            for url in urls:
-                lbl = f"`{url[:70]}...`" if len(url)>70 else f"`{url}`"
+
+            for url in valid_urls:
+                lbl = f"`{url[:70]}...`" if len(url) > 70 else f"`{url}`"
                 with st.status(f"🔄 Scraping {lbl}"):
                     fbs, nms, dts, src, err = scrape_url(url)
+
                     if err:
-                        if '\n' in str(err):
-                            st.markdown(f'<div style="background:rgba(233,30,99,0.1);border:1px solid rgba(233,30,99,0.4);border-radius:8px;padding:0.8rem 1rem;font-size:0.82rem;color:#ff8a80;">{err.replace(chr(10),"<br>")}</div>', unsafe_allow_html=True)
-                        else: st.error(err)
+                        # Render rich error with markdown + copy-able URLs
+                        err_html = str(err).replace('\n', '<br>').replace('`', '<code style="background:rgba(249,168,37,0.1);border:1px solid rgba(249,168,37,0.3);padding:1px 6px;border-radius:4px;">').replace('</code>','</code>')
+                        st.markdown(
+                            f'<div style="background:rgba(233,30,99,0.08);border:1px solid rgba(233,30,99,0.4);border-radius:10px;padding:1rem 1.2rem;font-size:0.84rem;color:#ffcdd2;line-height:1.8;">{err_html}</div>',
+                            unsafe_allow_html=True
+                        )
+
                     if fbs:
                         st.success(f"✅ **{len(fbs)}** entries from **{src}** · {sum(1 for n in nms if n)} named · {sum(1 for d in dts if d)} dated")
-                        all_fb.extend(fbs); all_n.extend(nms); all_d.extend(dts); all_s.extend([src]*len(fbs))
+                        all_fb.extend(fbs); all_n.extend(nms); all_d.extend(dts)
+                        all_s.extend([src]*len(fbs))
+
             if all_fb:
                 clean_fb, clean_n, clean_d, clean_s = [], [], [], []
                 for fb, n, d, s in zip(all_fb, all_n, all_d, all_s):
-                    if not is_junk(fb): clean_fb.append(fb); clean_n.append(n); clean_d.append(d); clean_s.append(s)
+                    if not is_junk(fb):
+                        clean_fb.append(fb); clean_n.append(n)
+                        clean_d.append(d); clean_s.append(s)
                 junk_rm = len(all_fb) - len(clean_fb)
                 if not clean_fb:
-                    st.error("⚠️ All scraped content appears to be website UI / error pages. Try CSV Upload.")
+                    st.error("⚠️ All scraped content was website chrome (menus, footers, error pages). Try CSV Upload.")
                 else:
                     info = f"📊 Scraped **{len(all_fb)}** · kept **{len(clean_fb)}** real entries"
                     if junk_rm > 0: info += f" · removed **{junk_rm}** junk"
                     st.info(info + " · Running analysis...")
-                    fd = pd.DataFrame({'Feedback':clean_fb,'_s':clean_s,'_n':clean_n,'_d':clean_d})
+                    fd = pd.DataFrame({'Feedback': clean_fb, '_s': clean_s, '_n': clean_n, '_d': clean_d})
                     fd['_c'] = fd['Feedback'].apply(preprocess)
-                    fd = fd[fd['_c'].str.strip()!=''].reset_index(drop=True)
-                    if fd.empty: st.error("❌ No processable feedback after cleaning.")
+                    fd = fd[fd['_c'].str.strip() != ''].reset_index(drop=True)
+                    if fd.empty:
+                        st.error("❌ No processable feedback after cleaning.")
                     else:
-                        fd['TopicID'] = topic_model(fd['_c'].tolist()); fd['Topic'] = fd['TopicID'].map(TOPIC_LABELS)
-                        fd = fd.rename(columns={'_n':'Reviewer_Name'})
+                        fd['TopicID'] = topic_model(fd['_c'].tolist())
+                        fd['Topic'] = fd['TopicID'].map(TOPIC_LABELS)
+                        fd = fd.rename(columns={'_n': 'Reviewer_Name'})
                         ai_names, sugs, sents = run_ai_analysis(fd, mode='full')
                         final_names = []
                         for scraped, ai_nm in zip(fd['Reviewer_Name'].tolist(), ai_names):
@@ -1584,22 +1687,41 @@ Sites requiring login → use CSV Upload instead
                             elif ai_nm and str(ai_nm).strip(): final_names.append(str(ai_nm).strip())
                             else: final_names.append('')
                         fd['Reviewer_Name'] = final_names
-                        fd['Suggestion'] = [s.strip() if s and isinstance(s,str) and len(s.strip())>20 else generate_fallback_suggestion(f,t)
-                                            for s,t,f in zip(sugs, fd['TopicID'], fd['Feedback'])]
+                        fd['Suggestion'] = [
+                            s.strip() if s and isinstance(s, str) and len(s.strip()) > 20
+                            else generate_fallback_suggestion(f, t)
+                            for s, t, f in zip(sugs, fd['TopicID'], fd['Feedback'])
+                        ]
                         fd['Sentiment'] = sents
-                        results = fd.rename(columns={'_s':'Source','_d':'Feedback_Date'})[['Source','Reviewer_Name','Feedback_Date','Feedback','Topic','Sentiment','Suggestion']]
+                        results = fd.rename(columns={'_s': 'Source', '_d': 'Feedback_Date'})[
+                            ['Source','Reviewer_Name','Feedback_Date','Feedback','Topic','Sentiment','Suggestion']]
                         results = assign_ids(results)
                         st.session_state.results_df = results; st.session_state.analyzed = True
                         src_label = ", ".join(dict.fromkeys(clean_s))
-                        saved, skipped = save_entries(sid, results); save_session(sid, nm, uid8, src_label, saved, notes_url)
+                        saved, skipped = save_entries(sid, results)
+                        save_session(sid, nm, uid8, src_label, saved, notes_url)
                         if 'Sentiment' in results.columns:
                             sc = results['Sentiment'].value_counts()
-                            st.info("🎯 Sentiment: " + " · ".join([f"**{s}**: {c}" for s,c in sc.items()]))
+                            st.info("🎯 Sentiment: " + " · ".join([f"**{s}**: {c}" for s, c in sc.items()]))
                         msg = f"✅ **{len(results):,}** results · **{saved:,}** new saved"
                         if skipped > 0: msg += f" · **{skipped}** already in DB"
                         st.success(msg + " → **📊 Results**")
-            else:
-                st.error("No feedback extracted. Try CSV Upload or a different URL.")
+            elif valid_urls:
+                # No data AND no helpful error shown yet — show universal fallback guidance
+                st.markdown("""
+<div style="background:rgba(249,168,37,0.07);border:1px solid rgba(249,168,37,0.35);border-radius:12px;padding:1.2rem 1.5rem;">
+  <div style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#f9a825;letter-spacing:2px;text-transform:uppercase;margin-bottom:0.8rem;">⚠️ No feedback extracted</div>
+  <div style="font-size:0.87rem;color:#ccc;line-height:1.9;">
+    This usually means the site requires login, uses heavy JavaScript, or blocks automated requests.<br><br>
+    <strong style="color:#f9a825;">Try these instead:</strong><br>
+    • <strong>CSV Upload tab</strong> — copy reviews manually → paste into CSV → upload<br>
+    • <strong>Reddit</strong> — use old.reddit.com URLs (no login needed)<br>
+    • <strong>Trustpilot</strong> — fully public and scrapeable<br>
+    • <strong>Amazon Reviews</strong> — product review pages work well<br>
+    • <strong>TripAdvisor</strong> — restaurant/hotel review pages work well
+  </div>
+</div>""", unsafe_allow_html=True)
+
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════
