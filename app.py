@@ -15,8 +15,6 @@ from nltk.stem import WordNetLemmatizer
 
 # ── Streamlit Cloud: NO Selenium / ChromeDriver ─────────────
 # All scraping uses requests + BeautifulSoup only.
-# JS-heavy sites handled via: mobile URLs, AMP pages,
-# internal JSON APIs, and per-domain parsing strategies.
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -76,7 +74,7 @@ TOPIC_LABELS = {
 TOPIC_COLORS = {0:"badge-0",1:"badge-1",2:"badge-2",3:"badge-3",4:"badge-4"}
 
 # ══════════════════════════════════════════════════════════════
-# SENTIMENT ENGINE — rule-based + optional AI upgrade
+# SENTIMENT ENGINE
 # ══════════════════════════════════════════════════════════════
 
 _POS = re.compile(
@@ -239,8 +237,7 @@ def generate_fallback_suggestion(feedback_text: str, topic_id: int) -> str:
     return templates[idx]
 
 # ══════════════════════════════════════════════════════════════
-# DATABASE  (SQLite — persists in /tmp on Streamlit Cloud per session)
-# For production: swap sqlite3 for st.connection("postgresql") or TinyDB
+# DATABASE
 # ══════════════════════════════════════════════════════════════
 
 DB_PATH = "zeus_feedback.db"
@@ -265,6 +262,7 @@ def get_prefix(src):
     return c[:2] if len(c) >= 2 else 'FB'
 
 def assign_ids(df):
+    """Assign IDs while strictly preserving the existing row order."""
     ctr = {}
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -276,6 +274,7 @@ def assign_ids(df):
                 if ctr.get(p, 0) <= n: ctr[p] = n+1
     except: pass
     ids, local = [], {}
+    # ── FIX: iterate in existing df order, no sorting ──
     for _, row in df.iterrows():
         p = get_prefix(row['Source'])
         if p not in local: local[p] = ctr.get(p, 1)
@@ -379,6 +378,7 @@ def save_entries(session_id, df):
     conn = sqlite3.connect(DB_PATH); c = conn.cursor()
     at = datetime.now().strftime("%Y-%m-%d %H:%M:%S"); saved = 0; skipped = 0
     _ensure_cache_loaded()
+    # ── FIX: iterate in df order (no sorting here) ──
     for _, row in df.iterrows():
         fb = row.get('Feedback', ''); h = make_content_hash(fb)
         if h in _HASH_CACHE: skipped += 1; continue
@@ -399,7 +399,8 @@ def get_all_sessions():
 
 def get_session_entries(sid):
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT feedback_id,source,reviewer_name,feedback_date,feedback,topic,sentiment,suggestion,analyzed_at FROM feedback_entries WHERE session_id=? ORDER BY id", conn, params=(sid,))
+    # ── FIX: order by id so DB insertion order = display order ──
+    df = pd.read_sql_query("SELECT feedback_id,source,reviewer_name,feedback_date,feedback,topic,sentiment,suggestion,analyzed_at FROM feedback_entries WHERE session_id=? ORDER BY id ASC", conn, params=(sid,))
     conn.close(); return df
 
 def get_full_db_export():
@@ -407,7 +408,7 @@ def get_full_db_export():
     df = pd.read_sql_query("""SELECT f.feedback_id,f.source,f.reviewer_name,f.feedback_date,
         f.feedback,f.topic,f.sentiment,f.suggestion,f.analyzed_at,s.user_name
         FROM sessions s JOIN feedback_entries f ON s.session_id=f.session_id
-        ORDER BY s.created_at DESC,f.id""", conn)
+        ORDER BY s.created_at DESC, f.id ASC""", conn)
     conn.close(); return df
 
 def delete_session(sid):
@@ -537,42 +538,70 @@ def run_ai_analysis(fb_df, mode='full'):
     return ai_names, sugs, sents
 
 def build_results(fbs, src, names=None, dates=None, mode='full'):
+    """
+    Build results DataFrame preserving the original scrape/input order throughout.
+    Every step stamps _orig_pos and sorts by it before proceeding.
+    """
     if names is None: names = [''] * len(fbs)
     if dates is None: dates = [''] * len(fbs)
-    valid = [(fb, nm, dt) for fb, nm, dt in zip(fbs, names, dates)
-             if fb and str(fb).strip() and not is_junk(str(fb))]
+
+    # ── STEP 1: filter junk but keep original position index ──
+    valid = []
+    for i, (fb, nm, dt) in enumerate(zip(fbs, names, dates)):
+        if fb and str(fb).strip() and not is_junk(str(fb)):
+            valid.append((i, fb, nm, dt))   # i = original webpage position
+
     if not valid: return pd.DataFrame()
-    fbs2, names2, dates2 = map(list, zip(*valid))
-    df = pd.DataFrame({'Feedback': fbs2, 'Source': src, 'Reviewer_Name': names2, 'Feedback_Date': dates2})
+
+    positions, fbs2, names2, dates2 = zip(*valid)
+
+    df = pd.DataFrame({
+        'Feedback':      list(fbs2),
+        'Source':        src,
+        'Reviewer_Name': list(names2),
+        'Feedback_Date': list(dates2),
+        '_orig_pos':     list(positions),   # ← carry original order
+    })
+
+    # ── STEP 2: preprocess for NLP, stamp pos BEFORE filtering ──
     df['_c'] = df['Feedback'].apply(preprocess)
-    df = df[df['_c'].str.strip() != ''].reset_index(drop=True)
-    if df.empty: return df
-    df['TopicID'] = topic_model(df['_c'].tolist()); df['Topic'] = df['TopicID'].map(TOPIC_LABELS)
+
+    # Filter empty preprocessed but preserve _orig_pos — DO NOT reset_index yet
+    df = df[df['_c'].str.strip() != '']
+
+    if df.empty: return pd.DataFrame()
+
+    # ── STEP 3: topic model — operates on current rows only ──
+    df['TopicID'] = topic_model(df['_c'].tolist())
+    df['Topic']   = df['TopicID'].map(TOPIC_LABELS)
+
+    # ── STEP 4: AI analysis ──
     ai_names, sugs, sents = run_ai_analysis(df, mode=mode)
+
     final_names = []
     for scraped, ai_nm in zip(df['Reviewer_Name'].tolist(), ai_names):
-        if scraped and str(scraped).strip() and scraped not in ('nan','None',''): final_names.append(str(scraped).strip())
-        elif ai_nm and str(ai_nm).strip(): final_names.append(str(ai_nm).strip())
-        else: final_names.append('')
+        if scraped and str(scraped).strip() and scraped not in ('nan','None',''):
+            final_names.append(str(scraped).strip())
+        elif ai_nm and str(ai_nm).strip():
+            final_names.append(str(ai_nm).strip())
+        else:
+            final_names.append('')
+
     df['Reviewer_Name'] = final_names
-    df['Suggestion'] = [s.strip() if s and isinstance(s,str) and len(s.strip())>20 else generate_fallback_suggestion(f, t)
-                        for s, t, f in zip(sugs, df['TopicID'], df['Feedback'])]
+    df['Suggestion'] = [
+        s.strip() if s and isinstance(s, str) and len(s.strip()) > 20
+        else generate_fallback_suggestion(f, t)
+        for s, t, f in zip(sugs, df['TopicID'], df['Feedback'])
+    ]
     df['Sentiment'] = sents
+
+    # ── STEP 5: sort by original webpage order before assigning IDs ──
+    df = df.sort_values('_orig_pos').reset_index(drop=True)
+
     return assign_ids(df[['Source','Reviewer_Name','Feedback_Date','Feedback','Topic','Sentiment','Suggestion']])
 
 # ══════════════════════════════════════════════════════════════
-# SCRAPING ENGINE — Streamlit Cloud compatible (no Selenium)
-#
-# Strategy per domain:
-#   Quora       → /sitemap answer pages + JSON API mining + AMP pages
-#   Reddit      → old.reddit.com (static HTML, no JS required)
-#   Trustpilot  → paginated static HTML
-#   Amazon      → mobile product review pages
-#   TripAdvisor → paginated static HTML
-#   Zomato      → mobile web + JSON API
-#   G2/Capterra → static paginated
-#   Glassdoor   → static HTML attempt + clear error if blocked
-#   Generic     → BS4 multi-page with rotating UA
+# SCRAPING ENGINE
 # ══════════════════════════════════════════════════════════════
 
 _USER_AGENTS = [
@@ -599,30 +628,36 @@ def _get_headers(mobile=False):
     }
 
 def _fetch(url, timeout=15, mobile=False, retries=2):
-    """Robust fetch with retries and rotating UA."""
     session = requests.Session()
     for attempt in range(retries + 1):
         try:
             resp = session.get(url, headers=_get_headers(mobile), timeout=timeout,
                                allow_redirects=True)
             if resp.status_code == 200: return resp
-            if resp.status_code == 403: return None  # blocked, don't retry
+            # ── log for debug expander ──
+            st.session_state.setdefault('_scrape_log', []).append(
+                f"HTTP {resp.status_code} — {url[:100]}"
+            )
+            if resp.status_code == 403: return None
             if resp.status_code == 429:
                 time.sleep(2 ** attempt); continue
         except requests.exceptions.Timeout:
+            st.session_state.setdefault('_scrape_log', []).append(f"TIMEOUT — {url[:100]}")
             if attempt == retries: return None
             time.sleep(1)
-        except Exception: return None
+        except Exception as e:
+            st.session_state.setdefault('_scrape_log', []).append(f"ERROR {e} — {url[:100]}")
+            return None
     return None
 
-# ── Text quality helpers ───────────────────────────────────
+# ── Text quality helpers ──
 
 _JUNK_RE = re.compile(
-    r'^(upvote|share|comment|follow|log\s?in|sign\s?in|sign\s?up|related|sponsored'
-    r'|privacy|terms|contact|your\s+ad\s+choices|\u00a9|copyright|page\s+not\s+found'
+    r'^(upvote|share\s|log\s?in|sign\s?in|sign\s?up|related|sponsored'
+    r'|privacy\s+policy|terms\s+of\s+service|\u00a9|copyright|page\s+not\s+found'
     r'|404|security\s+service|please\s+enable\s+javascript|cloudflare|access\s+denied'
     r'|you\s+have\s+been\s+blocked|cookies?\s+policy|all\s+rights\s+reserved'
-    r'|follow\s+us|subscribe|newsletter|download\s+the\s+app|write\s+a\s+review'
+    r'|follow\s+us\s|subscribe\s|newsletter|download\s+the\s+app|write\s+a\s+review'
     r'|add\s+a\s+review|loading\.\.\.|please\s+wait|redirecting)', re.I)
 
 _JUNK_PATTERNS = [
@@ -709,26 +744,38 @@ def _extract_date(el) -> str:
     return ''
 
 def extract_blocks_generic(soup, min_len=80) -> list:
-    """Generic BS4 block extractor — works on any site."""
+    """
+    Generic BS4 block extractor — preserves DOM order.
+    Uses a positional counter so blocks can always be sorted
+    back to their original top-to-bottom webpage order.
+    """
     seen, blocks = set(), []
+    position = 0  # ── tracks DOM top-to-bottom order ──
+
     containers = soup.find_all(True,
         class_=re.compile(r'review|comment|feedback|answer|post|testimonial|customer[-_]?review|rating[-_]?item', re.I),
         limit=500)
+
     def process(text, name='', date=''):
+        nonlocal position
         cl = clean_text(text)
         if is_junk(cl) or len(cl) < min_len: return
-        if is_truncated(cl): return  # skip preview snippets
+        if is_truncated(cl): return
         k = cl[:120].lower()
         if k in seen: return
         seen.add(k)
         if len(cl) > 3000:
             tr = cl[:3000]; lp = max(tr.rfind('.'), tr.rfind('!'), tr.rfind('?'))
             cl = cl[:lp+1] if lp > 600 else tr
-        blocks.append({'text': cl, 'name': name, 'date': date})
+        blocks.append({'text': cl, 'name': name, 'date': date, 'pos': position})
+        position += 1
+
     for c in containers:
         if _BAD_CLS.search(' '.join(c.get('class') or [])): continue
         raw = c.get_text(' ', strip=True)
         process(raw, _extract_name(c), _extract_date(c))
+
+    # Fallback: paragraph-level pass when container pass found nothing
     if not blocks:
         from bs4 import Tag
         for el in soup.find_all(['div','p','section','article','li','blockquote']):
@@ -736,15 +783,19 @@ def extract_blocks_generic(soup, min_len=80) -> list:
             if _BAD_CLS.search(' '.join(el.get('class') or [])): continue
             if len(el.find_all(['div','section','article'])) > 3: continue
             raw = el.get_text(' ', strip=True)
-            if len(raw) < min_len: continue
+            # ── FIX: require sentence punctuation to reduce nav/footer capture ──
+            if len(raw) < min_len or not re.search(r'[.!?]', raw): continue
             bad = any(_BAD_CLS.search(' '.join(p.get('class') or '')) or getattr(p,'name','') in ('header','footer','nav','aside')
                       for p in el.parents if hasattr(p,'get'))
             if bad: continue
             process(raw, date=_extract_date(el))
+
+    # ── FIX: always sort by DOM position before returning ──
+    blocks.sort(key=lambda x: x['pos'])
     return blocks
 
 def json_mine(html_src: str) -> list:
-    """Extract long text strings from embedded JSON in page source."""
+    """Extract long text strings from embedded JSON — preserves encounter order."""
     results, seen = [], set()
     for m in re.finditer(r'"(?:text|content|body|answer|description|reviewText|fullText)"\s*:\s*"([^"]{150,})"', html_src):
         cand = m.group(1).replace('\\n',' ').replace('\\t',' ').replace('\\"','"')
@@ -756,10 +807,68 @@ def json_mine(html_src: str) -> list:
         seen.add(k); results.append({'text': cl, 'name': '', 'date': ''})
     return results
 
-# ── Domain-specific scrapers ──────────────────────────────
+# ── SerpAPI Quora scraper (reusable function) ──
+
+def _scrape_quora_via_serpapi(query: str, api_key: str, pages: int = 2):
+    """
+    Reusable SerpAPI Quora scraper.
+    Callable from scrape_quora() automatically if SERPAPI_KEY is set,
+    or from Tab 3 manually. Returns (fbs, names, dates) in result order.
+    """
+    fbs, names, dates = [], [], []
+    seen = set()
+    for page_num in range(pages):
+        try:
+            params = {
+                "engine": "google",
+                "q": f"site:quora.com {query}",
+                "api_key": api_key,
+                "num": "10",
+                "start": str(page_num * 10),
+                "hl": "en"
+            }
+            resp = requests.get("https://serpapi.com/search", params=params, timeout=15)
+            if resp.status_code != 200:
+                st.session_state.setdefault('_scrape_log', []).append(
+                    f"SerpAPI HTTP {resp.status_code} — page {page_num+1}"
+                )
+                break
+            data = resp.json()
+            for r in data.get("organic_results", []):
+                link = r.get("link", "")
+                if any(x in link for x in ["/topic/", "/profile/", "/search"]):
+                    continue
+                title = r.get("title", "")
+                name = ""
+                by_m = re.search(r"(?:answer(?:ed)? by|by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", title, re.I)
+                if by_m: name = by_m.group(1).strip()
+                snippet = r.get("snippet", "") or r.get("snippet_highlighted_words", "")
+                if isinstance(snippet, list): snippet = " ".join(snippet)
+                for key in ("rich_snippet", "about_this_result"):
+                    extra = r.get(key, {})
+                    if isinstance(extra, dict):
+                        for v in extra.values():
+                            if isinstance(v, str) and len(v) > 80:
+                                snippet = (snippet + " " + v).strip()
+                if not snippet or len(snippet.strip()) < 60: continue
+                cl = clean_text(snippet.strip())
+                cl = re.sub(r"^\d+\s+(?:answers?|votes?)\s*[·•]\s*", "", cl, flags=re.I)
+                cl = re.sub(r"^Quora\s*[·•]\s*", "", cl, flags=re.I)
+                cl = re.sub(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\s*[·•]?\s*", "", cl, flags=re.I)
+                if is_junk(cl) or len(cl) < 60: continue
+                k = cl[:120].lower()
+                if k in seen: continue
+                seen.add(k)
+                fbs.append(cl); names.append(name); dates.append("")
+            time.sleep(0.5)
+        except Exception as e:
+            st.session_state.setdefault('_scrape_log', []).append(f"SerpAPI error: {e}")
+            break
+    return fbs, names, dates
+
+# ── Domain-specific scrapers ──
 
 def _google_amp_cache_fetch(quora_url: str) -> str:
-    """Fetch a Quora page via Google AMP Cache — bypasses Quora IP blocks."""
     try:
         clean = quora_url.replace('https://','').replace('http://','')
         amp_cache = f"https://www-quora-com.cdn.ampproject.org/v/s/{clean}?amp_js_v=0.1"
@@ -768,9 +877,7 @@ def _google_amp_cache_fetch(quora_url: str) -> str:
     except: pass
     return ''
 
-
 def _wayback_fetch(quora_url: str) -> str:
-    """Fetch a cached Quora page from archive.org Wayback Machine."""
     try:
         check = _fetch(f"https://archive.org/wayback/available?url={requests.utils.quote(quora_url)}", timeout=10)
         if not check: return ''
@@ -781,22 +888,16 @@ def _wayback_fetch(quora_url: str) -> str:
     except: pass
     return ''
 
-
 def _extract_quora_from_html(html: str, seen: set, fbs: list, names: list, dates: list, min_len=80) -> int:
-    """Extract Quora answer text from any HTML (AMP cache / Wayback / direct)."""
     if not html or len(html) < 200: return 0
     before = len(fbs)
-
     def _add(text, name='', date=''):
         cl = clean_text(str(text))
         if not cl or is_junk(cl) or len(cl) < min_len or is_truncated(cl): return
         k = cl[:120].lower()
         if k in seen: return
         seen.add(k); fbs.append(cl); names.append(name); dates.append(date)
-
     soup = BeautifulSoup(html, 'html.parser')
-
-    # JSON-LD structured data — most reliable, full answer text
     for script in soup.find_all('script', type='application/ld+json'):
         try:
             data = json.loads(script.string or '')
@@ -811,67 +912,46 @@ def _extract_quora_from_html(html: str, seen: set, fbs: list, names: list, dates
                         if txt and len(txt) > min_len:
                             author = a.get('author',{})
                             _add(txt, author.get('name','') if isinstance(author,dict) else str(author))
-                for item2 in item.get('itemListElement',[]):
-                    item3 = item2.get('item', item2)
-                    for key in ('acceptedAnswer','suggestedAnswer','answer','text','description'):
-                        val = item3.get(key,'')
-                        if isinstance(val, str) and len(val) > min_len: _add(val)
-                        elif isinstance(val, dict):
-                            txt = val.get('text','') or val.get('description','')
-                            if txt and len(txt) > min_len: _add(txt)
         except: pass
-
-    # Embedded JSON bundles (answerText, qtext, body fields)
     for script in soup.find_all('script'):
         src_txt = script.string or ''
         if len(src_txt) < 200: continue
         for m in re.finditer(
             r'"(?:answerText|qtext|body|content|fullContent|textContent|answerContent)"\s*:\s*"([^"]{' + str(min_len) + r',})"',
-            src_txt
-        ):
+            src_txt):
             raw = m.group(1).replace('\\n',' ').replace('\\t',' ').replace('\\"','"')
             raw = re.sub(r'\\u[0-9a-fA-F]{4}',' ', raw)
             _add(raw)
-
-    # Generic HTML block extraction
     if len(fbs) - before < 3:
         for b in extract_blocks_generic(soup, min_len=min_len):
             _add(b['text'], b['name'], b['date'])
-
-    # Raw JSON string mining
     if len(fbs) - before < 3:
         for b in json_mine(html):
             if len(b['text']) >= min_len: _add(b['text'])
-
     return len(fbs) - before
-
 
 def scrape_quora(url: str):
     """
-    Quora scraper — Streamlit Cloud compatible.
-    Bypasses IP blocks via: Google AMP Cache → Wayback Machine → Direct fetch.
+    Quora scraper — tries SerpAPI first (if key set), then AMP/Wayback fallbacks.
+    Order of results matches SerpAPI ranking / DOM order.
     """
     fbs, names, dates = [], [], []
     seen: set = set()
 
-    # Derive query and candidate URLs
+    # ── Extract query from URL ──
     query = ''
     candidate_urls = []
-    is_answer_url = '/answer/' in url
-    is_question_url = bool(re.search(r'quora\.com/[A-Z][^/?#]{8,}$', url))
-
     if '/topic/' in url:
         slug_m = re.search(r'/topic/([^/?#]+)', url)
-        if slug_m:
-            query = re.sub(r'[-_%+]',' ', requests.utils.unquote(slug_m.group(1))).strip()
-    elif is_answer_url or is_question_url:
+        if slug_m: query = re.sub(r'[-_%+]',' ', requests.utils.unquote(slug_m.group(1))).strip()
+    elif '/answer/' in url or re.search(r'quora\.com/[A-Z][^/?#]{8,}$', url):
         candidate_urls = [url]
         path = re.sub(r'https?://(www\.)?quora\.com','', url).strip('/')
         slug = path.split('/answer/')[0] if '/answer/' in path else path.split('/')[0]
         query = re.sub(r'[-_]',' ', slug)[:60]
     elif '/search' in url or 'type=answer' in url:
         q_m = re.search(r'[?&]q=([^&]+)', url)
-        if q_m: query = requests.utils.unquote(q_m.group(1)).replace('+',' ').replace('%20',' ').strip()
+        if q_m: query = requests.utils.unquote(q_m.group(1)).replace('+',' ').strip()
     else:
         q_m = re.search(r'[?&]q=([^&]+)', url)
         if q_m: query = requests.utils.unquote(q_m.group(1)).replace('+',' ').strip()
@@ -880,19 +960,28 @@ def scrape_quora(url: str):
         path = re.sub(r'https?://(www\.)?quora\.com/?','', url).split('?')[0]
         query = re.sub(r'[-_/]',' ', path).strip()[:60] or 'barbeque nation review'
 
-    # ── Method 1: Google AMP Cache ─────────────────────────────
-    # Google CDN caches AMP pages — served from Google IPs, bypasses Quora blocks
+    # ── Method 0: SerpAPI (automatic if key present) ──
+    serp_key = os.getenv("SERPAPI_KEY", "")
+    if serp_key and query:
+        sf, sn, sd = _scrape_quora_via_serpapi(query, serp_key, pages=2)
+        for fb, nm, dt in zip(sf, sn, sd):
+            k = fb[:120].lower()
+            if k not in seen:
+                seen.add(k); fbs.append(fb); names.append(nm); dates.append(dt)
+        if len(fbs) >= 5:
+            return fbs[:200], names[:200], dates[:200], None
+
+    # ── Method 1: Google AMP Cache ──
     for cand in candidate_urls:
         html = _google_amp_cache_fetch(cand)
         if html: _extract_quora_from_html(html, seen, fbs, names, dates)
         if len(fbs) >= 5: break
 
-    # Also try AMP cache for the URL itself
     if len(fbs) < 5 and url not in candidate_urls:
         html = _google_amp_cache_fetch(url)
         if html: _extract_quora_from_html(html, seen, fbs, names, dates)
 
-    # ── Method 2: Wayback Machine cached copies ────────────────
+    # ── Method 2: Wayback Machine ──
     if len(fbs) < 5:
         for wb_url in (candidate_urls or [url])[:3]:
             html = _wayback_fetch(wb_url)
@@ -900,14 +989,13 @@ def scrape_quora(url: str):
             if len(fbs) >= 5: break
             time.sleep(0.4)
 
-    # Try Wayback for search URL version too
     if len(fbs) < 5 and query:
         qe = requests.utils.quote(query)
         wb_search = f"https://www.quora.com/search?q={qe}&type=answer"
         html = _wayback_fetch(wb_search)
         if html: _extract_quora_from_html(html, seen, fbs, names, dates)
 
-    # ── Method 3: Direct AMP fetch ─────────────────────────────
+    # ── Method 3: Direct AMP fetch ──
     if len(fbs) < 5:
         for d_url in (candidate_urls or [url])[:3]:
             for try_url in [d_url, d_url.replace('www.quora.com','amp.quora.com')]:
@@ -916,45 +1004,21 @@ def scrape_quora(url: str):
                 if len(fbs) >= 5: break
             time.sleep(0.3)
 
-    # ── Method 4: Quora sitemap → AMP cache ───────────────────
-    if len(fbs) < 5 and query:
-        try:
-            sm_resp = _fetch('https://www.quora.com/sitemap.xml', timeout=8)
-            if sm_resp:
-                sm_soup = BeautifulSoup(sm_resp.text, 'xml')
-                sitemap_urls = [loc.get_text() for loc in sm_soup.find_all('loc')][:10]
-                q_words = {w for w in query.lower().split() if len(w) > 3}
-                for sm_url in sitemap_urls[:4]:
-                    sm_r = _fetch(sm_url, timeout=8)
-                    if not sm_r: continue
-                    sm_s = BeautifulSoup(sm_r.text, 'xml')
-                    for loc in sm_s.find_all('loc'):
-                        page_url = loc.get_text().strip()
-                        if not ('quora.com' in page_url and '/topic/' not in page_url): continue
-                        if any(w in page_url.lower() for w in q_words):
-                            html = _google_amp_cache_fetch(page_url) or _wayback_fetch(page_url)
-                            if html: _extract_quora_from_html(html, seen, fbs, names, dates)
-                        if len(fbs) >= 10: break
-                    if len(fbs) >= 10: break
-        except: pass
-
     if not fbs:
-        q_display = query or 'Barbeque Nation review'
+        q_display = query or 'your topic'
         return [], [], [], (
             f"⚠️ Could not retrieve Quora answers for \"{q_display}\".\n\n"
-            f"The Google AMP Cache and Wayback Machine found no cached content for this topic.\n\n"
-            f"✅ CSV Upload (fastest — 2 minutes):\n"
-            f"1. Open quora.com in your browser\n"
-            f"2. Search: {q_display}\n"
-            f"3. Copy answers into a spreadsheet (one per row)\n"
-            f"4. Save as CSV → upload via the 📄 CSV Upload tab"
+            f"Add SERPAPI_KEY to .env for automatic scraping, "
+            f"or use Tab 3 → Method 2 to paste answers directly.\n\n"
+            f"✅ Quick workaround:\n"
+            f"1. Open quora.com → Search: {q_display}\n"
+            f"2. Copy answers → Tab 3 → Paste & Analyze"
         )
 
     return fbs[:200], names[:200], dates[:200], None
 
 
 def scrape_reddit(url: str):
-    """Reddit: use old.reddit.com which returns full static HTML."""
     url = url.replace('www.reddit.com','old.reddit.com').replace('reddit.com','old.reddit.com')
     if 'old.reddit.com' not in url: url = url.replace('reddit.com','old.reddit.com')
     fbs, names, dates = [], [], []; seen = set()
@@ -962,7 +1026,6 @@ def scrape_reddit(url: str):
         resp = _fetch(url, timeout=12)
         if not resp: break
         soup = BeautifulSoup(resp.text, 'html.parser')
-        # old.reddit comments: div.usertext-body > div.md
         for el in soup.select('div.usertext-body div.md'):
             raw = el.get_text(' ', strip=True)
             cl = clean_text(raw)
@@ -976,14 +1039,12 @@ def scrape_reddit(url: str):
                 a = parent.find('a', class_=re.compile(r'author'))
                 if a: name = a.get_text(strip=True)
             fbs.append(cl); names.append(name); dates.append(_extract_date(el))
-        # Also get post body
         for el in soup.select('div.expando div.md'):
             raw = el.get_text(' ', strip=True)
             cl = clean_text(raw)
             if not is_junk(cl) and len(cl) > 80:
                 k = cl[:120].lower()
                 if k not in seen: seen.add(k); fbs.append(cl); names.append(''); dates.append('')
-        # Next page
         nxt = soup.find('a', rel='next')
         if nxt and nxt.get('href'):
             url = nxt['href'] if nxt['href'].startswith('http') else 'https://old.reddit.com' + nxt['href']
@@ -993,7 +1054,6 @@ def scrape_reddit(url: str):
 
 
 def scrape_trustpilot(url: str):
-    """Trustpilot: fully static paginated HTML."""
     base = re.sub(r'[?&]page=\d+', '', url).rstrip('/')
     fbs, names, dates = [], [], []; seen = set()
     for page in range(1, 8):
@@ -1002,12 +1062,10 @@ def scrape_trustpilot(url: str):
         if not resp: break
         soup = BeautifulSoup(resp.text, 'html.parser')
         reviews = soup.select('article[data-service-review-business-unit-display-name], div[class*="reviewCard"], section[class*="review"]')
-        if not reviews:
-            reviews = soup.find_all('article')
+        if not reviews: reviews = soup.find_all('article')
         if not reviews: break
         new_found = False
         for r in reviews:
-            # Full review text
             body = r.find('p', attrs={'data-service-review-text-typography': True}) or \
                    r.find('p', class_=re.compile(r'typography_body|review-content|reviewText', re.I))
             raw = body.get_text(' ', strip=True) if body else r.get_text(' ', strip=True)
@@ -1024,10 +1082,7 @@ def scrape_trustpilot(url: str):
 
 
 def scrape_amazon(url: str):
-    """Amazon reviews: use mobile URL + JSON-LD + structured review selectors."""
-    # Convert to mobile URL for less JS
-    mob_url = url.replace('www.amazon.', 'www.amazon.').replace('/dp/', '/dp/')
-    # Amazon review pages
+    mob_url = url
     if '/product-reviews/' not in url and '/dp/' in url:
         asin_m = re.search(r'/dp/([A-Z0-9]{10})', url)
         if asin_m:
@@ -1062,7 +1117,6 @@ def scrape_amazon(url: str):
 
 
 def scrape_tripadvisor(url: str):
-    """TripAdvisor: static paginated reviews."""
     base = re.sub(r'-or\d+\.html', '.html', url)
     fbs, names, dates = [], [], []; seen = set()
     for page in range(0, 6):
@@ -1074,7 +1128,6 @@ def scrape_tripadvisor(url: str):
         resp = _fetch(page_url, timeout=15, mobile=False)
         if not resp: break
         soup = BeautifulSoup(resp.text, 'html.parser')
-        # JSON-LD has full review text on TripAdvisor
         for script in soup.find_all('script', type='application/ld+json'):
             try:
                 data = json.loads(script.string or '')
@@ -1090,7 +1143,6 @@ def scrape_tripadvisor(url: str):
                                 name = author.get('name','') if isinstance(author,dict) else str(author)
                                 fbs.append(cl); names.append(name); dates.append(rev.get('datePublished',''))
             except: pass
-        # HTML fallback
         blocks = extract_blocks_generic(soup, min_len=80)
         for b in blocks:
             k = b['text'][:120].lower()
@@ -1101,10 +1153,7 @@ def scrape_tripadvisor(url: str):
 
 
 def scrape_zomato(url: str):
-    """Zomato: try mobile web + JSON API endpoint."""
     fbs, names, dates = [], [], []; seen = set()
-    # Zomato exposes reviews via internal API for restaurant pages
-    # Pattern: zomato.com/city/restaurant-name-id/reviews
     res_id_m = re.search(r'\.com/[^/]+/[^/]+-(\d+)(?:/|$)', url)
     if res_id_m:
         res_id = res_id_m.group(1)
@@ -1124,9 +1173,8 @@ def scrape_zomato(url: str):
                         cl = clean_text(body); k = cl[:120].lower()
                         if k not in seen: seen.add(k); fbs.append(cl); names.append(rev.get('reviewerName','')); dates.append('')
             except: pass
-    # Fallback: mobile page
     if not fbs:
-        mob = url.replace('www.zomato.com','www.zomato.com') + ('?reviews&page=1' if '?' not in url else '&page=1')
+        mob = url + ('?reviews&page=1' if '?' not in url else '&page=1')
         for page in range(1, 4):
             resp = _fetch(mob, timeout=12, mobile=True)
             if not resp: break
@@ -1144,11 +1192,7 @@ def scrape_zomato(url: str):
 
 
 def scrape_glassdoor(url: str):
-    """Glassdoor: attempt static fetch with correct headers."""
     fbs, names, dates = [], [], []; seen = set()
-    headers = _get_headers()
-    headers['Referer'] = 'https://www.glassdoor.com/'
-    headers['Cookie'] = 'GSESSIONID=undefined'
     for page in range(1, 4):
         page_url = re.sub(r'_P\d+\.htm', f'_P{page}.htm', url) if '_P' in url else url
         resp = _fetch(page_url, timeout=15)
@@ -1168,7 +1212,6 @@ def scrape_glassdoor(url: str):
 
 
 def scrape_generic(url: str, max_pages=5):
-    """Generic multi-page BS4 scraper for any site."""
     domain = re.sub(r'https?://(www\.)?','', url).split('/')[0].lower()
     base = re.sub(r'[?&]page=\d+|[?&]start=\d+', '', url).rstrip('/')
     current = url; fbs, names, dates = [], [], []; seen = set(); err = None
@@ -1183,7 +1226,6 @@ def scrape_generic(url: str, max_pages=5):
         for b in new:
             seen.add(b['text'][:120].lower())
             fbs.append(b['text']); names.append(b['name']); dates.append(b['date'])
-        # Pagination
         nxt = soup.find('a', rel='next') or soup.find('a', class_=re.compile(r'\bnext\b', re.I))
         if nxt and nxt.get('href'):
             h = nxt['href']
@@ -1193,7 +1235,6 @@ def scrape_generic(url: str, max_pages=5):
             current = f"{base}{sep}page={page+1}"
         time.sleep(0.4)
     if not fbs and not err:
-        # Try JSON mining as last resort
         resp = _fetch(url, timeout=12)
         if resp:
             for b in json_mine(resp.text):
@@ -1204,10 +1245,6 @@ def scrape_generic(url: str, max_pages=5):
 
 
 def scrape_url(url: str):
-    """
-    Master scraper — routes to the right strategy based on domain.
-    All methods use requests + BeautifulSoup only (Streamlit Cloud compatible).
-    """
     domain = re.sub(r'https?://(www\.)?','', url).split('/')[0].lower()
     source_map = {
         'quora':'Quora', 'reddit':'Reddit', 'trustpilot':'Trustpilot',
@@ -1287,18 +1324,17 @@ def make_feedback_excel(df, session_id, user_name):
     dtc=gc(['Feedback_Date','feedback_date']); fbc=gc(['Feedback','feedback'])
     tpc=gc(['Topic','topic']); sgc=gc(['Suggestion','suggestion']); stc=gc(['Sentiment','sentiment'])
     src=gc(['Source','source'])
+
+    # ── FIX: keep original row order — do NOT reorder by named/unnamed ──
     df2 = df.copy()
-    if rvc:
-        named = df2[df2[rvc].str.strip().ne('')].drop_duplicates(subset=[rvc],keep='first')
-        unnamed = df2[df2[rvc].str.strip().eq('')]
-        df2 = pd.concat([named,unnamed]).sort_index().reset_index(drop=True)
+
     src_label = ', '.join(df2[src].unique()[:3]) if src else 'N/A'
     wb = WB(); ws1 = wb.active; ws1.title = 'Feedback Data'; ws1.sheet_view.showGridLines = False
     ws1.merge_cells(start_row=1,start_column=1,end_row=1,end_column=8)
     c = ws1.cell(row=1,column=1,value=f'  ⚡ ZEUS — {src_label}  |  {len(df2)} Entries  |  {datetime.now().strftime("%d %b %Y")}')
     c.font=ft(13,True,GOLD); c.fill=fl(DARK); c.alignment=al('left','center'); ws1.row_dimensions[1].height=32
     ws1.merge_cells(start_row=2,start_column=1,end_row=2,end_column=8)
-    c = ws1.cell(row=2,column=1,value=f'  Analyst: {user_name}  ·  Session: {session_id}  ·  Unique entries only')
+    c = ws1.cell(row=2,column=1,value=f'  Analyst: {user_name}  ·  Session: {session_id}  ·  Preserving original review order')
     c.font=ft(9,False,WHITE); c.fill=fl(NAV); c.alignment=al('left','center'); ws1.row_dimensions[2].height=16
     ws1.row_dimensions[3].height = 4
     HDRS = ['S.No','ID','Name of Feedbacker','Date','Feedback','Type','Sentiment','AI Suggestion']
@@ -1386,7 +1422,7 @@ def make_db_excel():
     c=ws.cell(row=1,column=1,value=f'  🗄️ ZEUS Full Database  |  {len(df)} Entries  |  {datetime.now().strftime("%d %b %Y")}')
     c.font=ft(13,True,GOLD); c.fill=fl(DARK); c.alignment=al('left','center'); ws.row_dimensions[1].height=32
     ws.merge_cells(start_row=2,start_column=1,end_row=2,end_column=8)
-    c=ws.cell(row=2,column=1,value='  All sessions combined  ·  Unique IDs  ·  No repeated reviewers')
+    c=ws.cell(row=2,column=1,value='  All sessions combined  ·  Original review order preserved')
     c.font=ft(9,False,WHITE); c.fill=fl(NAV); c.alignment=al('left','center'); ws.row_dimensions[2].height=16
     ws.row_dimensions[3].height=4
     HDRS=['S.No','ID','Name of Feedbacker','Date','Feedback','Type','Sentiment','AI Suggestion']
@@ -1443,15 +1479,16 @@ with st.sidebar:
         st.markdown(f'<div class="session-box">🔑 Active Session<br><strong style="font-size:0.65rem;">{st.session_state.session_id}</strong></div>', unsafe_allow_html=True)
     st.divider()
     st.success("✅ OpenAI key loaded") if openai.api_key else st.warning("⚠️ No OPENAI_API_KEY — rule-based sentiment + keyword suggestions active")
+    if os.getenv("SERPAPI_KEY"): st.success("✅ SerpAPI key loaded — Quora auto-scraping enabled")
     st.divider()
     st.markdown("**🎯 Sentiment Engine**")
     st.markdown('<div style="font-family:Space Mono,monospace;font-size:0.68rem;color:#888;line-height:1.8;">Rule-based → always runs.<br>AI upgrade → uncertain cases only.<br>Positive | Negative | Neutral | Mixed</div>', unsafe_allow_html=True)
     st.divider()
     st.markdown("**🔍 Cloud Scraper**")
-    st.markdown('<div style="font-family:Space Mono,monospace;font-size:0.68rem;color:#888;line-height:1.8;">requests + BeautifulSoup only.<br>No Selenium / ChromeDriver.<br>Domain-aware strategies.<br>AMP · JSON API · Mobile UA.<br>Full text — no truncation.</div>', unsafe_allow_html=True)
+    st.markdown('<div style="font-family:Space Mono,monospace;font-size:0.68rem;color:#888;line-height:1.8;">requests + BeautifulSoup only.<br>Original webpage order preserved.<br>DOM position stamped per block.<br>No Selenium / ChromeDriver.</div>', unsafe_allow_html=True)
     st.divider()
     st.markdown("**📌 Supported Sources**")
-    for s in ["CSV Upload","Quora (AMP + JSON-LD)","Reddit (old.reddit.com)","Trustpilot","Amazon Reviews","TripAdvisor","Zomato","Glassdoor (best effort)","G2 / Capterra","Any public URL"]:
+    for s in ["CSV Upload","Quora (SerpAPI + AMP + JSON-LD)","Reddit (old.reddit.com)","Trustpilot","Amazon Reviews","TripAdvisor","Zomato","Glassdoor (best effort)","G2 / Capterra","Any public URL"]:
         st.markdown(f'<div style="font-family:Space Mono,monospace;font-size:0.7rem;color:#aaa;margin:2px 0;">· {s}</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════
@@ -1459,7 +1496,7 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════
 
 st.markdown('<div class="hero-title">⚡ ZEUS FEEDBACK ANALYZER</div>', unsafe_allow_html=True)
-st.markdown('<div class="hero-sub">Customer Intelligence · Topic Modeling · Real Sentiment · Streamlit Cloud Ready</div>', unsafe_allow_html=True)
+st.markdown('<div class="hero-sub">Customer Intelligence · Topic Modeling · Real Sentiment · Original Order Preserved</div>', unsafe_allow_html=True)
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📄 CSV Upload","🔗 URL Scraper","🔵 Quora","📊 Results","🗄️ History"])
 
@@ -1513,27 +1550,14 @@ with tab1:
 # ══════════════════════════════════════════════════════════════
 
 def _url_preflight_check(url: str):
-    """
-    Instantly check a URL before scraping and return (is_blocked, warning_html).
-    Detects known dead-end URL patterns that will never return data.
-    Returns None if URL looks fine.
-    """
     if not url: return None
     url_l = url.lower()
-
-    # ── Quora /topic/ page — allow through, scraper handles it ──
-    # (returns None so it is NOT blocked by pre-scrape check)
-    if 'quora.com/topic/' in url_l:
-        return None
-
-    # ── Quora /profile/ page ──────────────────────────────────
+    if 'quora.com/topic/' in url_l: return None
     if 'quora.com/profile/' in url_l:
         return """<div style="background:rgba(233,30,99,0.08);border:1px solid rgba(233,30,99,0.5);border-radius:12px;padding:1.2rem 1.5rem;margin-bottom:1rem;">
   <div style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#e91e63;letter-spacing:2px;text-transform:uppercase;margin-bottom:0.6rem;">⛔ Quora profile pages require login</div>
-  <div style="font-size:0.88rem;color:#ddd;">Use a direct question or answer URL instead: <code>quora.com/Question-text/answer/Person-name</code></div>
+  <div style="font-size:0.88rem;color:#ddd;">Use a direct question or answer URL instead.</div>
 </div>"""
-
-    # ── Generic login wall patterns ───────────────────────────
     login_patterns = [
         ('linkedin.com',    'LinkedIn requires login for all pages.'),
         ('facebook.com',    'Facebook requires login.'),
@@ -1548,9 +1572,7 @@ def _url_preflight_check(url: str):
   <div style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#e91e63;margin-bottom:0.4rem;">⛔ Login required</div>
   <div style="font-size:0.85rem;color:#ddd;">{msg} Copy content manually → use CSV Upload tab.</div>
 </div>"""
-
-    return None  # URL looks fine, proceed
-
+    return None
 
 with tab2:
     st.markdown('<div class="card"><div class="card-title">🌐 Scrape from URL</div>', unsafe_allow_html=True)
@@ -1562,13 +1584,11 @@ with tab2:
 
     notes_url = st.text_input("Session notes", placeholder="e.g. Competitor analysis", key="nu")
 
-    # ── Site capability reference ────────────────────────────
     with st.expander("ℹ️ What can be scraped from Streamlit Cloud?", expanded=False):
         st.markdown("""
 | Source | Works? | Notes |
 |--------|--------|-------|
-| **Quora** — direct answer/question URL | ✅ | e.g. `quora.com/Question/answer/Name` |
-| **Quora** — /topic/ or /profile/ page | ❌ | Login required — use CSV Upload |
+| **Quora** — direct answer/question URL | ✅ | Auto-uses SerpAPI if key set |
 | **Reddit** | ✅ | Uses old.reddit.com static HTML |
 | **Trustpilot** | ✅ | Paginated static pages |
 | **Amazon Reviews** | ✅ | Product review pages |
@@ -1580,6 +1600,9 @@ with tab2:
 """)
 
     if st.button("🔍 Scrape & Analyze", key="url_btn"):
+        # Clear old scrape log
+        st.session_state['_scrape_log'] = []
+
         urls = []
         if multi_mode and multi_urls_text.strip():
             urls = [u.strip() for u in multi_urls_text.strip().split('\n') if u.strip().startswith('http')]
@@ -1588,17 +1611,13 @@ with tab2:
         if not urls:
             st.warning("⚠️ Enter at least one valid URL.")
         else:
-            # Pre-scrape check — block known dead-end URLs immediately
             blocked_urls = []
             valid_urls = []
             for u in urls:
                 pf = _url_preflight_check(u)
-                if pf:
-                    blocked_urls.append((u, pf))
-                else:
-                    valid_urls.append(u)
+                if pf: blocked_urls.append((u, pf))
+                else: valid_urls.append(u)
 
-            # Show blocks for bad URLs
             for bad_url, pf_html in blocked_urls:
                 st.markdown(pf_html, unsafe_allow_html=True)
 
@@ -1608,7 +1627,10 @@ with tab2:
             nm = st.session_state.user_name or "USER"
             sid, uid8 = gen_sid(nm)
             st.session_state.session_id = sid; st.session_state.short_uuid = uid8
-            all_fb, all_n, all_d, all_s = [], [], [], []
+
+            # ── FIX: use ordered list of dicts instead of parallel lists ──
+            all_items = []
+            global_pos = 0
 
             for url in valid_urls:
                 lbl = f"`{url[:70]}...`" if len(url) > 70 else f"`{url}`"
@@ -1616,40 +1638,58 @@ with tab2:
                     fbs, nms, dts, src, err = scrape_url(url)
 
                     if err:
-                        # Render rich error with markdown + copy-able URLs
-                        err_html = str(err).replace('\n', '<br>').replace('`', '<code style="background:rgba(249,168,37,0.1);border:1px solid rgba(249,168,37,0.3);padding:1px 6px;border-radius:4px;">').replace('</code>','</code>')
+                        err_html = str(err).replace('\n', '<br>')
                         st.markdown(
                             f'<div style="background:rgba(233,30,99,0.08);border:1px solid rgba(233,30,99,0.4);border-radius:10px;padding:1rem 1.2rem;font-size:0.84rem;color:#ffcdd2;line-height:1.8;">{err_html}</div>',
-                            unsafe_allow_html=True
-                        )
+                            unsafe_allow_html=True)
 
                     if fbs:
-                        st.success(f"✅ **{len(fbs)}** entries from **{src}** · {sum(1 for n in nms if n)} named · {sum(1 for d in dts if d)} dated")
-                        all_fb.extend(fbs); all_n.extend(nms); all_d.extend(dts)
-                        all_s.extend([src]*len(fbs))
+                        st.success(f"✅ **{len(fbs)}** entries from **{src}** · {sum(1 for n in nms if n)} named")
+                        # Attach global position so multi-URL order is deterministic
+                        for fb, nm_r, dt in zip(fbs, nms, dts):
+                            all_items.append({
+                                'feedback': fb, 'name': nm_r,
+                                'date': dt, 'source': src,
+                                'scrape_order': global_pos
+                            })
+                            global_pos += 1
 
-            if all_fb:
-                clean_fb, clean_n, clean_d, clean_s = [], [], [], []
-                for fb, n, d, s in zip(all_fb, all_n, all_d, all_s):
-                    if not is_junk(fb):
-                        clean_fb.append(fb); clean_n.append(n)
-                        clean_d.append(d); clean_s.append(s)
-                junk_rm = len(all_fb) - len(clean_fb)
-                if not clean_fb:
-                    st.error("⚠️ All scraped content was website chrome (menus, footers, error pages). Try CSV Upload.")
+            if all_items:
+                # Sort by scrape order (preserves per-URL page order)
+                all_items.sort(key=lambda x: x['scrape_order'])
+
+                clean_items = [it for it in all_items if not is_junk(it['feedback'])]
+                junk_rm = len(all_items) - len(clean_items)
+
+                if not clean_items:
+                    st.error("⚠️ All scraped content was website chrome (menus, footers). Try CSV Upload.")
                 else:
-                    info = f"📊 Scraped **{len(all_fb)}** · kept **{len(clean_fb)}** real entries"
+                    info = f"📊 Scraped **{len(all_items)}** · kept **{len(clean_items)}** real entries"
                     if junk_rm > 0: info += f" · removed **{junk_rm}** junk"
                     st.info(info + " · Running analysis...")
-                    fd = pd.DataFrame({'Feedback': clean_fb, '_s': clean_s, '_n': clean_n, '_d': clean_d})
+
+                    clean_fb  = [it['feedback'] for it in clean_items]
+                    clean_n   = [it['name']     for it in clean_items]
+                    clean_d   = [it['date']     for it in clean_items]
+                    clean_s   = [it['source']   for it in clean_items]
+
+                    fd = pd.DataFrame({
+                        'Feedback':      clean_fb,
+                        '_s':            clean_s,
+                        'Reviewer_Name': clean_n,
+                        '_d':            clean_d,
+                        '_orig_pos':     list(range(len(clean_items))),
+                    })
                     fd['_c'] = fd['Feedback'].apply(preprocess)
-                    fd = fd[fd['_c'].str.strip() != ''].reset_index(drop=True)
+                    fd = fd[fd['_c'].str.strip() != '']
+                    # Sort by original position after NLP filter
+                    fd = fd.sort_values('_orig_pos').reset_index(drop=True)
+
                     if fd.empty:
                         st.error("❌ No processable feedback after cleaning.")
                     else:
                         fd['TopicID'] = topic_model(fd['_c'].tolist())
                         fd['Topic'] = fd['TopicID'].map(TOPIC_LABELS)
-                        fd = fd.rename(columns={'_n': 'Reviewer_Name'})
                         ai_names, sugs, sents = run_ai_analysis(fd, mode='full')
                         final_names = []
                         for scraped, ai_nm in zip(fd['Reviewer_Name'].tolist(), ai_names):
@@ -1677,38 +1717,38 @@ with tab2:
                         if skipped > 0: msg += f" · **{skipped}** already in DB"
                         st.success(msg + " → **📊 Results**")
             elif valid_urls:
-                # No data AND no helpful error shown yet — show universal fallback guidance
                 st.markdown("""
 <div style="background:rgba(249,168,37,0.07);border:1px solid rgba(249,168,37,0.35);border-radius:12px;padding:1.2rem 1.5rem;">
   <div style="font-family:'Space Mono',monospace;font-size:0.72rem;color:#f9a825;letter-spacing:2px;text-transform:uppercase;margin-bottom:0.8rem;">⚠️ No feedback extracted</div>
   <div style="font-size:0.87rem;color:#ccc;line-height:1.9;">
-    This usually means the site requires login, uses heavy JavaScript, or blocks automated requests.<br><br>
-    <strong style="color:#f9a825;">Try these instead:</strong><br>
-    • <strong>CSV Upload tab</strong> — copy reviews manually → paste into CSV → upload<br>
-    • <strong>Reddit</strong> — use old.reddit.com URLs (no login needed)<br>
-    • <strong>Trustpilot</strong> — fully public and scrapeable<br>
-    • <strong>Amazon Reviews</strong> — product review pages work well<br>
-    • <strong>TripAdvisor</strong> — restaurant/hotel review pages work well
+    Site requires login, heavy JS, or blocks automated requests.<br><br>
+    <strong style="color:#f9a825;">Try instead:</strong><br>
+    • CSV Upload — copy reviews → paste into CSV → upload<br>
+    • Reddit, Trustpilot, Amazon, TripAdvisor — all public and scrapeable
   </div>
 </div>""", unsafe_allow_html=True)
+
+        # ── Debug log expander ──
+        if st.session_state.get('_scrape_log'):
+            with st.expander("🔍 Debug log (HTTP errors & timeouts)"):
+                for line in st.session_state['_scrape_log']:
+                    st.code(line)
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ══════════════════════════════════════════════════════════════
-# ══════════════════════════════════════════════════════════════
-# TAB 3 — QUORA FEEDBACK (dedicated paste + SerpAPI input)
+# TAB 3 — QUORA
 # ══════════════════════════════════════════════════════════════
 
 with tab3:
     st.markdown('<div class="card"><div class="card-title">🔵 Quora Feedback</div>', unsafe_allow_html=True)
 
-    # ── Why direct scraping doesn't work ──────────────────────
     st.markdown("""
 <div style="background:rgba(0,188,212,0.06);border:1px solid rgba(0,188,212,0.25);border-radius:10px;padding:1rem 1.4rem;margin-bottom:1.2rem;">
   <div style="font-family:'Space Mono',monospace;font-size:0.68rem;color:#00bcd4;letter-spacing:2px;text-transform:uppercase;margin-bottom:0.5rem;">ℹ️ About Quora Scraping</div>
   <div style="font-family:'Space Mono',monospace;font-size:0.65rem;color:#888;line-height:1.9;">
-    Quora blocks all cloud server IPs (AWS/GCP/Azure) — direct scraping is impossible from Streamlit Cloud.<br>
-    Use <strong style="color:#f9a825;">Method 1</strong> (SerpAPI — recommended) or <strong style="color:#f9a825;">Method 2</strong> (paste answers directly).
+    Quora blocks cloud server IPs. Set <strong style="color:#f9a825;">SERPAPI_KEY</strong> in .env for automatic scraping,
+    or paste answers directly below.
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -1718,12 +1758,6 @@ with tab3:
         label_visibility="collapsed"
     )
 
-    # ════════════════════════════════════════════════════════
-    # METHOD 1 — SerpAPI
-    # Free tier: 100 searches/month at serpapi.com
-    # Returns Google search results for site:quora.com queries
-    # which contain full snippets of Quora answer text
-    # ════════════════════════════════════════════════════════
     if "Method 1" in q_method:
         st.markdown("""
 <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:1rem 1.4rem;margin-bottom:1rem;">
@@ -1731,24 +1765,15 @@ with tab3:
     <strong style="color:#f9a825;">Get a free SerpAPI key (100 searches/month):</strong><br>
     1. Go to <code>serpapi.com</code> → Sign up free<br>
     2. Copy your API key from the dashboard<br>
-    3. Add it to Streamlit secrets as <code>SERPAPI_KEY</code><br>
-       &nbsp;&nbsp;&nbsp;<em>Or paste it below for this session only</em>
+    3. Add it to Streamlit secrets as <code>SERPAPI_KEY</code>
   </div>
 </div>""", unsafe_allow_html=True)
 
         serp_key = os.getenv("SERPAPI_KEY", "")
         if not serp_key:
-            serp_key = st.text_input(
-                "SerpAPI Key (session only, not saved)",
-                type="password",
-                placeholder="Paste your free SerpAPI key here..."
-            )
+            serp_key = st.text_input("SerpAPI Key (session only)", type="password", placeholder="Paste your free SerpAPI key here...")
 
-        q_query = st.text_input(
-            "What to search for on Quora",
-            placeholder="e.g. Barbeque Nation review experience",
-            value=""
-        )
+        q_query = st.text_input("What to search for on Quora", placeholder="e.g. Barbeque Nation review experience")
         q_pages = st.slider("Number of search pages (10 results each)", 1, 5, 2)
         q_notes = st.text_input("Session notes (optional)", placeholder="e.g. Quora Q1 2025", key="qn1")
 
@@ -1758,86 +1783,22 @@ with tab3:
             elif not q_query.strip():
                 st.error("❌ Enter a search query")
             else:
-                fbs, names, dates = [], [], []
-                seen = set()
                 nm = st.session_state.user_name or "USER"
                 sid, uid8 = gen_sid(nm)
                 st.session_state.session_id = sid; st.session_state.short_uuid = uid8
 
-                progress = st.progress(0)
-                status = st.empty()
+                progress = st.progress(0); status = st.empty()
+                status.markdown('<p class="pulse" style="color:#f9a825;font-family:Space Mono,monospace;font-size:0.8rem;">🔍 Fetching from SerpAPI...</p>', unsafe_allow_html=True)
 
-                for page_num in range(q_pages):
-                    status.markdown(f'<p class="pulse" style="color:#f9a825;font-family:Space Mono,monospace;font-size:0.8rem;">🔍 Fetching page {page_num+1}/{q_pages}...</p>', unsafe_allow_html=True)
-                    try:
-                        params = {
-                            "engine": "google",
-                            "q": f"site:quora.com {q_query}",
-                            "api_key": serp_key,
-                            "num": "10",
-                            "start": str(page_num * 10),
-                            "hl": "en"
-                        }
-                        resp = requests.get("https://serpapi.com/search", params=params, timeout=15)
-                        if resp.status_code != 200:
-                            st.warning(f"SerpAPI error on page {page_num+1}: HTTP {resp.status_code}")
-                            break
-
-                        data = resp.json()
-                        results = data.get("organic_results", [])
-
-                        for r in results:
-                            # Skip topic/profile/search pages
-                            link = r.get("link", "")
-                            if any(x in link for x in ["/topic/", "/profile/", "/search"]):
-                                continue
-
-                            # Title contains question + author
-                            title = r.get("title", "")
-                            name = ""
-                            by_m = re.search(r"(?:answer(?:ed)? by|by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", title, re.I)
-                            if by_m: name = by_m.group(1).strip()
-
-                            # snippet = the answer preview text (usually 200-400 chars)
-                            snippet = r.get("snippet", "") or r.get("snippet_highlighted_words", "")
-                            if isinstance(snippet, list): snippet = " ".join(snippet)
-
-                            # Also check rich_snippet / about_this_result
-                            for key in ("rich_snippet", "about_this_result"):
-                                extra = r.get(key, {})
-                                if isinstance(extra, dict):
-                                    for v in extra.values():
-                                        if isinstance(v, str) and len(v) > 80:
-                                            snippet = (snippet + " " + v).strip()
-
-                            if not snippet or len(snippet.strip()) < 60:
-                                continue
-
-                            # Clean snippet
-                            cl = clean_text(snippet.strip())
-                            cl = re.sub(r"^\d+\s+(?:answers?|votes?)\s*[·•]\s*", "", cl, flags=re.I)
-                            cl = re.sub(r"^Quora\s*[·•]\s*", "", cl, flags=re.I)
-                            cl = re.sub(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\s*[·•]?\s*", "", cl, flags=re.I)
-
-                            if is_junk(cl) or len(cl) < 60: continue
-                            k = cl[:120].lower()
-                            if k in seen: continue
-                            seen.add(k)
-                            fbs.append(cl); names.append(name); dates.append("")
-
-                        progress.progress((page_num + 1) / q_pages)
-                        time.sleep(0.5)
-
-                    except Exception as e:
-                        st.warning(f"⚠️ Error on page {page_num+1}: {e}")
-                        break
-
-                status.empty(); progress.empty()
+                # ── Use the shared reusable function ──
+                fbs, names, dates = _scrape_quora_via_serpapi(q_query.strip(), serp_key, pages=q_pages)
+                progress.progress(0.5)
 
                 if fbs:
                     st.success(f"✅ Found **{len(fbs)}** Quora answer snippets")
-                    with st.spinner("Analyzing..."):
-                        results_df = build_results(fbs, "Quora", names, dates, mode='full')
+                    status.markdown('<p class="pulse" style="color:#00bcd4;font-family:Space Mono,monospace;font-size:0.8rem;">🎯 Analyzing...</p>', unsafe_allow_html=True)
+                    results_df = build_results(fbs, "Quora", names, dates, mode='full')
+                    progress.progress(1.0); status.empty(); progress.empty()
                     if not results_df.empty:
                         st.session_state.results_df = results_df; st.session_state.analyzed = True
                         saved, skipped = save_entries(sid, results_df)
@@ -1849,33 +1810,26 @@ with tab3:
                         if skipped > 0: msg += f" ({skipped} duplicates skipped)"
                         st.success(msg)
                     else:
-                        st.error("❌ No processable feedback found in those results.")
+                        st.error("❌ No processable feedback found.")
                 else:
+                    progress.empty(); status.empty()
                     st.warning("⚠️ No Quora answers found. Try a different search query.")
 
-    # ════════════════════════════════════════════════════════
-    # METHOD 2 — Direct paste
-    # User copies answers from Quora manually and pastes here
-    # Supports bulk paste: one answer per line OR full paragraphs
-    # ════════════════════════════════════════════════════════
     else:
         st.markdown("""
 <div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:1rem 1.4rem;margin-bottom:1rem;">
   <div style="font-size:0.85rem;color:#ddd;line-height:1.8;">
     <strong style="color:#f9a825;">How to paste Quora answers:</strong><br>
     1. Open Quora → search for your topic<br>
-    2. Open each answer → Select All text → Copy<br>
-    3. Paste below (one answer per block, separated by blank lines)<br>
-    4. Click Analyze
+    2. Open each answer → Select All → Copy<br>
+    3. Paste below (separate multiple answers with a blank line)
   </div>
 </div>""", unsafe_allow_html=True)
 
         pasted_text = st.text_area(
             "Paste Quora answers here",
-            placeholder="Paste Quora answers here. Separate multiple answers with a blank line.\n\nExample:\nI visited Barbeque Nation last week — the experience was amazing...\n\nService was disappointing, we waited 40 minutes...",
-            height=300,
-            label_visibility="collapsed"
-        )
+            placeholder="Paste Quora answers here. Separate multiple answers with a blank line.",
+            height=300, label_visibility="collapsed")
         paste_notes = st.text_input("Session notes (optional)", placeholder="e.g. Quora answers March 2025", key="qn2")
 
         if st.button("⚡ Analyze Pasted Quora Text", key="paste_btn"):
@@ -1886,15 +1840,14 @@ with tab3:
                 sid, uid8 = gen_sid(nm)
                 st.session_state.session_id = sid; st.session_state.short_uuid = uid8
 
-                # Split into individual answers by blank lines
                 raw_blocks = re.split(r'\n\s*\n', pasted_text.strip())
                 fbs, names, dates = [], [], []
                 seen = set()
 
-                for block in raw_blocks:
+                # ── preserve paste order with enumerate ──
+                for i, block in enumerate(raw_blocks):
                     block = block.strip()
                     if not block or len(block) < 40: continue
-                    # Clean common Quora UI artifacts
                     block = re.sub(r'^\d+\s*(upvote|share|comment|follow|answer)s?\b.*', '', block, flags=re.I|re.M)
                     block = re.sub(r'(\d+[Kk]?\s*upvotes?|\d+[Kk]?\s*views?|\d+[Kk]?\s*shares?)\s*', '', block, flags=re.I)
                     block = block.strip()
@@ -1906,10 +1859,10 @@ with tab3:
                     names.append(''); dates.append('')
 
                 if not fbs:
-                    st.error("❌ No usable text found. Make sure you've pasted actual answer content.")
+                    st.error("❌ No usable text found.")
                 else:
-                    st.success(f"✅ Parsed **{len(fbs)}** answer block(s)")
-                    with st.spinner("Analyzing sentiment, topics, and generating AI suggestions..."):
+                    st.success(f"✅ Parsed **{len(fbs)}** answer block(s) — order preserved")
+                    with st.spinner("Analyzing..."):
                         results_df = build_results(fbs, "Quora", names, dates, mode='full')
                     if not results_df.empty:
                         st.session_state.results_df = results_df; st.session_state.analyzed = True
@@ -1926,6 +1879,7 @@ with tab3:
 
     st.markdown('</div>', unsafe_allow_html=True)
 
+# ══════════════════════════════════════════════════════════════
 # TAB 4 — RESULTS
 # ══════════════════════════════════════════════════════════════
 
@@ -1939,7 +1893,6 @@ with tab4:
         sid = st.session_state.session_id or "—"; uname = st.session_state.user_name or "—"
         tc = df['Topic'].value_counts()
         st.markdown(f'<div class="session-box">🔑 <strong>{sid}</strong> &nbsp;·&nbsp; 👤 {uname} &nbsp;·&nbsp; 📅 {datetime.now().strftime("%d %b %Y, %H:%M")} &nbsp;·&nbsp; 📊 {total} entries</div>', unsafe_allow_html=True)
-        # Metrics
         c1,c2,c3,c4,c5,c6 = st.columns(6)
         c1.metric("Total Entries", f"{total:,}"); c2.metric("Topics", df['Topic'].nunique()); c3.metric("Sources", df['Source'].nunique())
         named = df['Reviewer_Name'].astype(str).str.strip().ne('').sum() if 'Reviewer_Name' in df.columns else 0
@@ -1947,7 +1900,6 @@ with tab4:
         pos = df['Sentiment'].eq('Positive').sum() if 'Sentiment' in df.columns else 0
         neg = df['Sentiment'].eq('Negative').sum() if 'Sentiment' in df.columns else 0
         c5.metric("😊 Positive", pos); c6.metric("😞 Negative", neg)
-        # Sentiment distribution
         if 'Sentiment' in df.columns:
             st.divider(); st.markdown("### 🎯 Sentiment Distribution")
             sc = df['Sentiment'].value_counts(); sent_cols = st.columns(len(sc))
@@ -1960,7 +1912,6 @@ with tab4:
 <div style="font-size:1.4rem;font-weight:800;color:{col_h};font-family:'Space Mono',monospace;">{cnt}</div>
 <div style="font-size:0.72rem;color:#aaa;margin:2px 0;">{sent}</div>
 <div style="font-size:0.75rem;color:#555;">{round(cnt/total*100)}%</div></div>""", unsafe_allow_html=True)
-        # Topic distribution
         st.divider(); st.markdown("### 🗂️ Topic Distribution")
         cols = st.columns(min(len(tc),5))
         for i,(topic,count) in enumerate(tc.items()):
@@ -1969,7 +1920,6 @@ with tab4:
 <div style="font-size:1.6rem;font-weight:800;color:#f9a825;font-family:'Space Mono',monospace;">{count}</div>
 <div style="font-size:0.68rem;color:#aaa;margin:4px 0;">{topic}</div>
 <div style="font-size:0.75rem;color:#666;">{round(count/total*100)}%</div></div>""", unsafe_allow_html=True)
-        # Filter
         st.divider(); st.markdown("### 🔍 Browse & Filter")
         cf1,cf2,cf3,cf4 = st.columns(4)
         with cf1: tf = st.multiselect("Topic", df['Topic'].unique().tolist(), default=df['Topic'].unique().tolist())
@@ -1981,7 +1931,8 @@ with tab4:
         filtered = df[df['Topic'].isin(tf) & df['Source'].isin(sf)]
         if sent_filter != 'All' and 'Sentiment' in filtered.columns: filtered = filtered[filtered['Sentiment']==sent_filter]
         if search_q.strip(): filtered = filtered[filtered['Feedback'].str.contains(search_q.strip(), case=False, na=False)]
-        st.markdown(f'<div style="font-family:Space Mono,monospace;font-size:0.75rem;color:#888;margin-bottom:1rem;">Showing {len(filtered):,} of {total:,}</div>', unsafe_allow_html=True)
+        # ── NOTE: no sort_values here — preserve original scrape order ──
+        st.markdown(f'<div style="font-family:Space Mono,monospace;font-size:0.75rem;color:#888;margin-bottom:1rem;">Showing {len(filtered):,} of {total:,} · in original webpage order</div>', unsafe_allow_html=True)
         view = st.radio("View", ["📋 Table","🃏 Cards"], horizontal=True)
         if view == "📋 Table":
             dcols = [c for c in ['Feedback_ID','Source','Reviewer_Name','Feedback_Date','Feedback','Topic','Sentiment','Suggestion'] if c in filtered.columns]
@@ -2026,7 +1977,6 @@ with tab4:
     <div style="color:#b0b0b0;font-size:0.85rem;margin-top:4px;">{row.get('Suggestion','')}</div>
 </div></div>""", unsafe_allow_html=True)
             if len(filtered) > 30: st.info(f"Showing 30 cards. Switch to Table for all {len(filtered)}.")
-        # Downloads
         st.divider(); st.markdown("### 📥 Download")
         d1,d2,d3 = st.columns(3)
         with d1:
