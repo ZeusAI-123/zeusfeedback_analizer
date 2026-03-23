@@ -853,74 +853,141 @@ def json_mine(html_src: str) -> list:
 
 # ── SerpAPI Quora scraper (reusable function) ──
 
+def _walk_json_for_text(obj, found=None, depth=0):
+    """
+    Recursively walk any JSON object and collect all string values > 150 chars.
+    Strips HTML tags from strings before measuring length.
+    This is the correct way to extract answer text from Quora's __NEXT_DATA__.
+    """
+    if found is None: found = []
+    if depth > 25: return found
+    if isinstance(obj, str):
+        # strip HTML tags → plain text
+        plain = re.sub(r'<[^>]+>', ' ', obj)
+        plain = re.sub(r'\s+', ' ', plain).strip()
+        if len(plain) > 150:
+            found.append(plain)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _walk_json_for_text(v, found, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_json_for_text(v, found, depth + 1)
+    return found
+
+
 def _fetch_full_quora_answer(page_url: str) -> str:
     """
-    Fetch the full answer text from a single Quora answer page URL.
-    Tries 3 methods in order:
-      1. JSON-LD structured data (most reliable, full text)
-      2. Embedded JS JSON bundles (answerText, body fields)
-      3. BS4 HTML block extraction
-    Returns the longest clean text found, or '' if all fail.
+    Fetch the full answer text from a Quora answer page.
+
+    WHY the old approach (~200 chars) failed:
+      1. Quora is a React SPA — requests gets a shell <div id=root></div>,
+         no answer text in the initial HTML at all.
+      2. The regex [^\"]{200,} on raw JS stops at the first href=\"...\" quote
+         inside HTML-encoded answer content → partial or NO match.
+      3. Quora blocks cloud server IPs (AWS/Streamlit) → direct fetch = 403.
+
+    Correct approach (3 methods in order):
+      A. Google Cache URL — avoids Quora's IP block entirely, returns
+         full cached HTML with __NEXT_DATA__ containing answer content.
+      B. __NEXT_DATA__ JSON parse + recursive walk + HTML tag stripping —
+         correctly handles escaped quotes inside HTML-encoded answer text.
+      C. Wayback Machine cached copy as last resort.
     """
     best = ''
-    # Method 1: direct fetch + JSON-LD
+
+    def _try_extract(html: str) -> str:
+        """Extract longest answer text from any HTML page source."""
+        candidate = ''
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # ── Method A: __NEXT_DATA__ JSON (Quora's React data bundle) ──
+        nd = soup.find('script', id='__NEXT_DATA__')
+        if nd and nd.string:
+            try:
+                data = json.loads(nd.string.strip())
+                texts = _walk_json_for_text(data)
+                # sort by length, take the longest (= full answer body)
+                texts.sort(key=len, reverse=True)
+                for t in texts:
+                    if len(t) > len(candidate) and not is_junk(t):
+                        candidate = t
+                        break  # longest non-junk text is the answer
+            except Exception:
+                pass
+
+        if len(candidate) > 200:
+            return clean_text(candidate)
+
+        # ── Method B: JSON-LD structured data ──
+        for script in soup.find_all('script', type='application/ld+json'):
+            try:
+                data = json.loads(script.string or '')
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    main = item.get('mainEntity', item)
+                    for key in ('acceptedAnswer', 'suggestedAnswer', 'answer'):
+                        ans_list = main.get(key, [])
+                        if isinstance(ans_list, dict): ans_list = [ans_list]
+                        for a in (ans_list or []):
+                            txt = a.get('text', '') or a.get('description', '')
+                            plain = re.sub(r'<[^>]+>', ' ', txt)
+                            plain = re.sub(r'\s+', ' ', plain).strip()
+                            if len(plain) > len(candidate):
+                                candidate = plain
+            except Exception:
+                pass
+
+        if len(candidate) > 200:
+            return clean_text(candidate)
+
+        # ── Method C: any inline JSON bundle with answer fields ──
+        for script in soup.find_all('script'):
+            src = script.string or ''
+            if len(src) < 200: continue
+            # find JSON objects that have answer-like keys
+            for m in re.finditer(r'\{[^{}]{100,}\}', src):
+                try:
+                    obj = json.loads(m.group(0))
+                    texts = _walk_json_for_text(obj)
+                    for t in texts:
+                        if len(t) > len(candidate) and not is_junk(t):
+                            candidate = t
+                except Exception:
+                    pass
+
+        return clean_text(candidate) if len(candidate) > 100 else ''
+
+    # ── Attempt 1: Google Cache (bypasses Quora IP block) ──
+    cache_url = f"https://webcache.googleusercontent.com/search?q=cache:{requests.utils.quote(page_url)}&hl=en"
+    resp = _fetch(cache_url, timeout=15, mobile=False)
+    if resp and len(resp.text) > 500:
+        result = _try_extract(resp.text)
+        if len(result) > 200:
+            return result
+
+    # ── Attempt 2: Direct fetch desktop UA ──
     resp = _fetch(page_url, timeout=15, mobile=False)
-    if not resp:
-        # Try mobile UA
-        resp = _fetch(page_url, timeout=15, mobile=True)
-    if not resp:
-        return ''
+    if resp and len(resp.text) > 500:
+        result = _try_extract(resp.text)
+        if len(result) > 200:
+            return result
 
-    html = resp.text
-    soup = BeautifulSoup(html, 'html.parser')
+    # ── Attempt 3: Direct fetch mobile UA ──
+    resp = _fetch(page_url, timeout=15, mobile=True)
+    if resp and len(resp.text) > 500:
+        result = _try_extract(resp.text)
+        if len(result) > 200:
+            return result
 
-    # JSON-LD — most reliable source of full answer text
-    for script in soup.find_all('script', type='application/ld+json'):
-        try:
-            data = json.loads(script.string or '')
-            items = data if isinstance(data, list) else [data]
-            for item in items:
-                main = item.get('mainEntity', item)
-                for key in ('acceptedAnswer', 'suggestedAnswer', 'answer'):
-                    ans_list = main.get(key, [])
-                    if isinstance(ans_list, dict): ans_list = [ans_list]
-                    for a in (ans_list or []):
-                        txt = a.get('text', '') or a.get('description', '')
-                        if txt and len(txt) > len(best):
-                            best = txt
-        except: pass
+    # ── Attempt 4: Wayback Machine ──
+    wb_html = _wayback_fetch(page_url)
+    if wb_html:
+        result = _try_extract(wb_html)
+        if len(result) > 200:
+            return result
 
-    if len(best) > 200:
-        return clean_text(best)
-
-    # Embedded JS bundles — Quora stores full answer in page JS
-    for script in soup.find_all('script'):
-        src = script.string or ''
-        if len(src) < 100: continue
-        for m in re.finditer(
-            r'"(?:answerText|qtext|body|content|fullContent|textContent|answerContent|mainContent)"\s*:\s*"([^"]{200,})"',
-            src):
-            raw = m.group(1).replace('\\n', ' ').replace('\\t', ' ').replace('\\"', '"')
-            raw = re.sub(r'\\u[0-9a-fA-F]{4}', ' ', raw)
-            cl = clean_text(raw)
-            if len(cl) > len(best):
-                best = cl
-
-    if len(best) > 200:
-        return best
-
-    # BS4 fallback — grab the largest text block on the page
-    candidate = ''
-    for el in soup.find_all(['div', 'p', 'article', 'section']):
-        cls_str = ' '.join(el.get('class') or [])
-        if _BAD_CLS.search(cls_str): continue
-        raw = el.get_text(' ', strip=True)
-        if len(raw) > len(candidate) and not is_junk(raw):
-            candidate = raw
-    if len(candidate) > len(best):
-        best = clean_text(candidate)
-
-    return best if len(best) > 100 else ''
+    return best
 
 
 def _scrape_quora_via_serpapi(query: str, api_key: str, pages: int = 2):
