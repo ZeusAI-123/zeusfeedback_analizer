@@ -696,12 +696,28 @@ _TRUNC_RE = re.compile(
     r'(\.{2,}|…|\u2026)\s*$|\(more\)\s*$|\[more\]\s*$|'
     r'(?:read more|see more|show more|view more|continue reading|show full review)\s*$', re.I)
 
+# Detects if a snippet is a short Google/SerpAPI preview that needs full-page fetch
+_SNIPPET_TRUNC_RE = re.compile(
+    r'\(more\)\s*$|\[more\]\s*$|\.{2,}\s*$|…\s*$|\u2026\s*$|'
+    r'(?:read|see|show|view)\s+more\s*$|continue\s+reading\s*$', re.I)
+
 def is_truncated(text: str) -> bool:
-    # Only flag explicit "read more / ..." signals — never reject based on punctuation.
-    # Real reviews frequently end mid-word or with no period; killing them here is
-    # the single biggest cause of missing feedback.
+    # Only flag explicit truncation signals — never reject based on punctuation.
     if not text: return False
     return bool(_TRUNC_RE.search(text.strip()))
+
+def needs_full_fetch(text: str) -> bool:
+    """Returns True when text is clearly a short snippet ending in (more) / ... etc.
+    Used by SerpAPI scraper to decide whether to fetch the full page."""
+    if not text: return False
+    s = text.strip()
+    # short snippet + truncation marker = definitely needs full fetch
+    if len(s) < 600 and _SNIPPET_TRUNC_RE.search(s):
+        return True
+    # very short with no natural ending — probably a snippet too
+    if len(s) < 200:
+        return True
+    return False
 
 def clean_text(text: str) -> str:
     if not text or not isinstance(text, str): return ''
@@ -837,14 +853,95 @@ def json_mine(html_src: str) -> list:
 
 # ── SerpAPI Quora scraper (reusable function) ──
 
+def _fetch_full_quora_answer(page_url: str) -> str:
+    """
+    Fetch the full answer text from a single Quora answer page URL.
+    Tries 3 methods in order:
+      1. JSON-LD structured data (most reliable, full text)
+      2. Embedded JS JSON bundles (answerText, body fields)
+      3. BS4 HTML block extraction
+    Returns the longest clean text found, or '' if all fail.
+    """
+    best = ''
+    # Method 1: direct fetch + JSON-LD
+    resp = _fetch(page_url, timeout=15, mobile=False)
+    if not resp:
+        # Try mobile UA
+        resp = _fetch(page_url, timeout=15, mobile=True)
+    if not resp:
+        return ''
+
+    html = resp.text
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # JSON-LD — most reliable source of full answer text
+    for script in soup.find_all('script', type='application/ld+json'):
+        try:
+            data = json.loads(script.string or '')
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                main = item.get('mainEntity', item)
+                for key in ('acceptedAnswer', 'suggestedAnswer', 'answer'):
+                    ans_list = main.get(key, [])
+                    if isinstance(ans_list, dict): ans_list = [ans_list]
+                    for a in (ans_list or []):
+                        txt = a.get('text', '') or a.get('description', '')
+                        if txt and len(txt) > len(best):
+                            best = txt
+        except: pass
+
+    if len(best) > 200:
+        return clean_text(best)
+
+    # Embedded JS bundles — Quora stores full answer in page JS
+    for script in soup.find_all('script'):
+        src = script.string or ''
+        if len(src) < 100: continue
+        for m in re.finditer(
+            r'"(?:answerText|qtext|body|content|fullContent|textContent|answerContent|mainContent)"\s*:\s*"([^"]{200,})"',
+            src):
+            raw = m.group(1).replace('\\n', ' ').replace('\\t', ' ').replace('\\"', '"')
+            raw = re.sub(r'\\u[0-9a-fA-F]{4}', ' ', raw)
+            cl = clean_text(raw)
+            if len(cl) > len(best):
+                best = cl
+
+    if len(best) > 200:
+        return best
+
+    # BS4 fallback — grab the largest text block on the page
+    candidate = ''
+    for el in soup.find_all(['div', 'p', 'article', 'section']):
+        cls_str = ' '.join(el.get('class') or [])
+        if _BAD_CLS.search(cls_str): continue
+        raw = el.get_text(' ', strip=True)
+        if len(raw) > len(candidate) and not is_junk(raw):
+            candidate = raw
+    if len(candidate) > len(best):
+        best = clean_text(candidate)
+
+    return best if len(best) > 100 else ''
+
+
 def _scrape_quora_via_serpapi(query: str, api_key: str, pages: int = 2):
     """
-    Reusable SerpAPI Quora scraper.
-    Callable from scrape_quora() automatically if SERPAPI_KEY is set,
-    or from Tab 3 manually. Returns (fbs, names, dates) in result order.
+    SerpAPI Quora scraper — fetches FULL answer text, not just the snippet.
+
+    Problem being solved:
+      SerpAPI returns Google's cached snippet (~160 chars), ending in "(more)".
+      That's the preview Quora shows before the JS "expand" button.
+      We detect this with needs_full_fetch() and immediately GET the actual
+      Quora answer page to extract the complete text via JSON-LD / embedded JS.
+
+    Pipeline per result:
+      snippet received → needs_full_fetch()?
+        YES → fetch actual page URL → extract full answer → clean → save
+        NO  → clean snippet → save directly
     """
-    fbs, names, dates = [], [], []
+    rows = []   # list of dicts for clean DataFrame sort at end
     seen = set()
+    pos = 0
+
     for page_num in range(pages):
         try:
             params = {
@@ -858,41 +955,83 @@ def _scrape_quora_via_serpapi(query: str, api_key: str, pages: int = 2):
             resp = requests.get("https://serpapi.com/search", params=params, timeout=15)
             if resp.status_code != 200:
                 st.session_state.setdefault('_scrape_log', []).append(
-                    f"SerpAPI HTTP {resp.status_code} — page {page_num+1}"
-                )
+                    f"SerpAPI HTTP {resp.status_code} — page {page_num+1}")
                 break
+
             data = resp.json()
             for r in data.get("organic_results", []):
                 link = r.get("link", "")
+                # skip topic/profile/search pages — they have no single answer
                 if any(x in link for x in ["/topic/", "/profile/", "/search"]):
                     continue
+
+                # Extract reviewer name from title
                 title = r.get("title", "")
                 name = ""
-                by_m = re.search(r"(?:answer(?:ed)? by|by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})", title, re.I)
-                if by_m: name = by_m.group(1).strip()
+                by_m = re.search(
+                    r"(?:answer(?:ed)? by|by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
+                    title, re.I)
+                if by_m:
+                    name = by_m.group(1).strip()
+
+                # Get snippet as starting point
                 snippet = r.get("snippet", "") or r.get("snippet_highlighted_words", "")
-                if isinstance(snippet, list): snippet = " ".join(snippet)
+                if isinstance(snippet, list):
+                    snippet = " ".join(snippet)
+                # append any rich_snippet text
                 for key in ("rich_snippet", "about_this_result"):
                     extra = r.get(key, {})
                     if isinstance(extra, dict):
                         for v in extra.values():
                             if isinstance(v, str) and len(v) > 80:
                                 snippet = (snippet + " " + v).strip()
-                if not snippet or len(snippet.strip()) < 60: continue
-                cl = clean_text(snippet.strip())
-                cl = re.sub(r"^\d+\s+(?:answers?|votes?)\s*[·•]\s*", "", cl, flags=re.I)
-                cl = re.sub(r"^Quora\s*[·•]\s*", "", cl, flags=re.I)
-                cl = re.sub(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\s*[·•]?\s*", "", cl, flags=re.I)
-                if is_junk(cl) or len(cl) < 60: continue
-                k = cl[:120].lower()
-                if k in seen: continue
+
+                snippet = snippet.strip()
+
+                # ── KEY FIX: if snippet is short / ends in (more) → fetch full page ──
+                if link and needs_full_fetch(snippet):
+                    full = _fetch_full_quora_answer(link)
+                    if full and len(full) > len(snippet):
+                        final_text = full
+                        st.session_state.setdefault('_scrape_log', []).append(
+                            f"Full fetch: {len(final_text)} chars from {link[:80]}")
+                    else:
+                        # full fetch failed — use snippet as fallback
+                        final_text = clean_text(snippet)
+                        st.session_state.setdefault('_scrape_log', []).append(
+                            f"Full fetch failed, using snippet ({len(final_text)} chars): {link[:80]}")
+                else:
+                    final_text = clean_text(snippet)
+
+                # Clean up Quora UI artifacts
+                final_text = re.sub(r"^\d+\s+(?:answers?|votes?)\s*[·•]\s*", "", final_text, flags=re.I)
+                final_text = re.sub(r"^Quora\s*[·•]\s*", "", final_text, flags=re.I)
+                final_text = re.sub(
+                    r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}\s*[·•]?\s*",
+                    "", final_text, flags=re.I)
+
+                if is_junk(final_text) or len(final_text) < 60:
+                    continue
+
+                k = final_text[:120].lower()
+                if k in seen:
+                    continue
                 seen.add(k)
-                fbs.append(cl); names.append(name); dates.append("")
+                rows.append({'feedback': final_text, 'name': name, 'date': '', 'pos': pos})
+                pos += 1
+
             time.sleep(0.5)
+
         except Exception as e:
             st.session_state.setdefault('_scrape_log', []).append(f"SerpAPI error: {e}")
             break
-    return fbs, names, dates
+
+    if not rows:
+        return [], [], []
+
+    # clean → dedupe done above; convert → sort here
+    df = pd.DataFrame(rows).sort_values('pos').reset_index(drop=True)
+    return df['feedback'].tolist(), df['name'].tolist(), df['date'].tolist()
 
 # ── Domain-specific scrapers ──
 
@@ -1890,7 +2029,11 @@ with tab2:
 
         # ── Debug log expander ──
         if st.session_state.get('_scrape_log'):
-            with st.expander("🔍 Debug log (HTTP errors & timeouts)"):
+            full_fetches = [l for l in st.session_state['_scrape_log'] if 'Full fetch' in l]
+            errors = [l for l in st.session_state['_scrape_log'] if 'Full fetch' not in l]
+            if full_fetches:
+                st.success(f"🔍 Full-page fetches: **{len(full_fetches)}** answers upgraded from snippet → full text")
+            with st.expander("🔍 Debug log (HTTP errors, full-fetch details)"):
                 for line in st.session_state['_scrape_log']:
                     st.code(line)
 
@@ -1955,7 +2098,11 @@ with tab3:
                 progress.progress(0.5)
 
                 if fbs:
-                    st.success(f"✅ Found **{len(fbs)}** Quora answer snippets")
+                    full_fetched = len([l for l in st.session_state.get('_scrape_log',[]) if 'Full fetch:' in l])
+                    msg = f"✅ Found **{len(fbs)}** Quora answers"
+                    if full_fetched:
+                        msg += f" · **{full_fetched}** fetched as full text (not snippet)"
+                    st.success(msg)
                     status.markdown('<p class="pulse" style="color:#00bcd4;font-family:Space Mono,monospace;font-size:0.8rem;">🎯 Analyzing...</p>', unsafe_allow_html=True)
                     results_df = build_results(fbs, "Quora", names, dates, mode='full')
                     progress.progress(1.0); status.empty(); progress.empty()
