@@ -539,48 +539,60 @@ def run_ai_analysis(fb_df, mode='full'):
 
 def build_results(fbs, src, names=None, dates=None, mode='full'):
     """
-    Build results DataFrame preserving the original scrape/input order throughout.
-    Every step stamps _orig_pos and sorts by it before proceeding.
+    Pipeline: clean → dedupe → convert to DataFrame → sort by _orig_pos.
+
+    _orig_pos = integer index of the item in the raw scraped list.
+    It is stamped once at entry, carried through every filter/transform,
+    and used for a final sort_values() before IDs are assigned.
+    This guarantees row 1 = review 1 on the webpage, always.
     """
     if names is None: names = [''] * len(fbs)
     if dates is None: dates = [''] * len(fbs)
 
-    # ── STEP 1: filter junk but keep original position index ──
+    # ── 1. CLEAN + DEDUPE: filter junk, keep original position ──
+    seen_hashes = set()
     valid = []
     for i, (fb, nm, dt) in enumerate(zip(fbs, names, dates)):
-        if fb and str(fb).strip() and not is_junk(str(fb)):
-            valid.append((i, fb, nm, dt))   # i = original webpage position
+        if not fb or not str(fb).strip(): continue
+        fb_str = str(fb).strip()
+        if is_junk(fb_str): continue
+        h = make_content_hash(fb_str)
+        if h in seen_hashes: continue      # dedupe within this batch
+        seen_hashes.add(h)
+        valid.append((i, fb_str, nm, dt))  # i = original webpage position
 
     if not valid: return pd.DataFrame()
 
     positions, fbs2, names2, dates2 = zip(*valid)
 
+    # ── 2. CONVERT to DataFrame, carry _orig_pos ──
     df = pd.DataFrame({
         'Feedback':      list(fbs2),
         'Source':        src,
         'Reviewer_Name': list(names2),
         'Feedback_Date': list(dates2),
-        '_orig_pos':     list(positions),   # ← carry original order
+        '_orig_pos':     list(positions),
     })
 
-    # ── STEP 2: preprocess for NLP, stamp pos BEFORE filtering ──
+    # NLP preprocessing
     df['_c'] = df['Feedback'].apply(preprocess)
 
-    # Filter empty preprocessed but preserve _orig_pos — DO NOT reset_index yet
-    df = df[df['_c'].str.strip() != '']
+    # Drop rows where preprocessing returned empty string,
+    # then IMMEDIATELY reset_index so list assignments align
+    df = df[df['_c'].str.strip() != ''].reset_index(drop=True)
 
     if df.empty: return pd.DataFrame()
 
-    # ── STEP 3: topic model — operates on current rows only ──
+    # ── 3. ENRICH: topic model, AI, sentiment ──
     df['TopicID'] = topic_model(df['_c'].tolist())
     df['Topic']   = df['TopicID'].map(TOPIC_LABELS)
 
-    # ── STEP 4: AI analysis ──
     ai_names, sugs, sents = run_ai_analysis(df, mode=mode)
 
+    # list assignments now safe because index is 0,1,2,3...
     final_names = []
     for scraped, ai_nm in zip(df['Reviewer_Name'].tolist(), ai_names):
-        if scraped and str(scraped).strip() and scraped not in ('nan','None',''):
+        if scraped and str(scraped).strip() and scraped not in ('nan', 'None', ''):
             final_names.append(str(scraped).strip())
         elif ai_nm and str(ai_nm).strip():
             final_names.append(str(ai_nm).strip())
@@ -591,14 +603,15 @@ def build_results(fbs, src, names=None, dates=None, mode='full'):
     df['Suggestion'] = [
         s.strip() if s and isinstance(s, str) and len(s.strip()) > 20
         else generate_fallback_suggestion(f, t)
-        for s, t, f in zip(sugs, df['TopicID'], df['Feedback'])
+        for s, t, f in zip(sugs, df['TopicID'].tolist(), df['Feedback'].tolist())
     ]
     df['Sentiment'] = sents
 
-    # ── STEP 5: sort by original webpage order before assigning IDs ──
+    # ── 4. SORT by original webpage order ──
     df = df.sort_values('_orig_pos').reset_index(drop=True)
 
-    return assign_ids(df[['Source','Reviewer_Name','Feedback_Date','Feedback','Topic','Sentiment','Suggestion']])
+    return assign_ids(df[['Source', 'Reviewer_Name', 'Feedback_Date',
+                           'Feedback', 'Topic', 'Sentiment', 'Suggestion']])
 
 # ══════════════════════════════════════════════════════════════
 # SCRAPING ENGINE
@@ -684,11 +697,11 @@ _TRUNC_RE = re.compile(
     r'(?:read more|see more|show more|view more|continue reading|show full review)\s*$', re.I)
 
 def is_truncated(text: str) -> bool:
+    # Only flag explicit "read more / ..." signals — never reject based on punctuation.
+    # Real reviews frequently end mid-word or with no period; killing them here is
+    # the single biggest cause of missing feedback.
     if not text: return False
-    s = text.strip()
-    if _TRUNC_RE.search(s): return True
-    if len(s) > 100 and not re.search(r'[.!?"\'।]$', s): return True
-    return False
+    return bool(_TRUNC_RE.search(text.strip()))
 
 def clean_text(text: str) -> str:
     if not text or not isinstance(text, str): return ''
@@ -699,7 +712,7 @@ def clean_text(text: str) -> str:
     text = re.sub(r'[\.\u2026]+$', '', text).strip()
     return re.sub(r'\s+', ' ', text).strip()
 
-_BAD_CLS = re.compile(r'nav|menu|header|footer|sidebar|cookie|banner|modal|popup', re.I)
+_BAD_CLS = re.compile(r'\bnav\b|\bmenu\b|\bheader\b|\bfooter\b|\bsidebar\b|\bcookie\b|\bbanner\b|\bmodal\b|\bpopup\b', re.I)
 
 _NAME_STOP = {'nation','india','food','what','how','why','management','engineer','doctor',
               'anonymous','user','guest','customer','reviewer','author','member','profile',
@@ -745,52 +758,67 @@ def _extract_date(el) -> str:
 
 def extract_blocks_generic(soup, min_len=80) -> list:
     """
-    Generic BS4 block extractor — preserves DOM order.
-    Uses a positional counter so blocks can always be sorted
-    back to their original top-to-bottom webpage order.
+    Generic BS4 block extractor.
+    Strategy: clean → dedupe → convert to list-of-dicts → sort by DOM pos.
+    Every block carries a 'pos' integer = order it was encountered top-to-bottom.
+    Callers can rely on the returned list being in original webpage order.
     """
     seen, blocks = set(), []
-    position = 0  # ── tracks DOM top-to-bottom order ──
+    position = 0
 
     containers = soup.find_all(True,
-        class_=re.compile(r'review|comment|feedback|answer|post|testimonial|customer[-_]?review|rating[-_]?item', re.I),
+        class_=re.compile(
+            r'review|comment|feedback|answer|post|testimonial|'
+            r'customer[-_]?review|rating[-_]?item|user[-_]?review|'
+            r'opinion|critique|remark|evaluation', re.I),
         limit=500)
 
     def process(text, name='', date=''):
         nonlocal position
+        # clean
         cl = clean_text(text)
-        if is_junk(cl) or len(cl) < min_len: return
+        # dedupe
+        if not cl or is_junk(cl) or len(cl) < min_len: return
         if is_truncated(cl): return
         k = cl[:120].lower()
         if k in seen: return
         seen.add(k)
+        # truncate very long reviews at a sentence boundary
         if len(cl) > 3000:
-            tr = cl[:3000]; lp = max(tr.rfind('.'), tr.rfind('!'), tr.rfind('?'))
+            tr = cl[:3000]
+            lp = max(tr.rfind('.'), tr.rfind('!'), tr.rfind('?'))
             cl = cl[:lp+1] if lp > 600 else tr
+        # convert + stamp position
         blocks.append({'text': cl, 'name': name, 'date': date, 'pos': position})
         position += 1
 
+    # Pass 1: elements that have review-related CSS classes
     for c in containers:
-        if _BAD_CLS.search(' '.join(c.get('class') or [])): continue
+        cls_str = ' '.join(c.get('class') or [])
+        if _BAD_CLS.search(cls_str): continue
         raw = c.get_text(' ', strip=True)
         process(raw, _extract_name(c), _extract_date(c))
 
-    # Fallback: paragraph-level pass when container pass found nothing
+    # Pass 2: paragraph-level fallback when Pass 1 found nothing
+    # No punctuation requirement — many scraped reviews end without periods
     if not blocks:
         from bs4 import Tag
-        for el in soup.find_all(['div','p','section','article','li','blockquote']):
+        for el in soup.find_all(['div', 'p', 'section', 'article', 'li', 'blockquote']):
             if not isinstance(el, Tag): continue
-            if _BAD_CLS.search(' '.join(el.get('class') or [])): continue
-            if len(el.find_all(['div','section','article'])) > 3: continue
+            cls_str = ' '.join(el.get('class') or [])
+            if _BAD_CLS.search(cls_str): continue
+            # allow up to 5 nested block children (was 3 — too strict)
+            if len(el.find_all(['div', 'section', 'article'])) > 5: continue
             raw = el.get_text(' ', strip=True)
-            # ── FIX: require sentence punctuation to reduce nav/footer capture ──
-            if len(raw) < min_len or not re.search(r'[.!?]', raw): continue
-            bad = any(_BAD_CLS.search(' '.join(p.get('class') or '')) or getattr(p,'name','') in ('header','footer','nav','aside')
-                      for p in el.parents if hasattr(p,'get'))
+            if len(raw) < min_len or len(raw) > 8000: continue
+            bad = any(
+                _BAD_CLS.search(' '.join(p.get('class') or '')) or
+                getattr(p, 'name', '') in ('header', 'footer', 'nav', 'aside')
+                for p in el.parents if hasattr(p, 'get'))
             if bad: continue
             process(raw, date=_extract_date(el))
 
-    # ── FIX: always sort by DOM position before returning ──
+    # sort — guarantees caller always gets DOM top-to-bottom order
     blocks.sort(key=lambda x: x['pos'])
     return blocks
 
@@ -1019,13 +1047,33 @@ def scrape_quora(url: str):
 
 
 def scrape_reddit(url: str):
-    url = url.replace('www.reddit.com','old.reddit.com').replace('reddit.com','old.reddit.com')
-    if 'old.reddit.com' not in url: url = url.replace('reddit.com','old.reddit.com')
-    fbs, names, dates = [], [], []; seen = set()
+    """
+    Reddit scraper using old.reddit.com static HTML.
+    Order: post body (top of page) → comments (below) → page 2 → ...
+    Pipeline per page: clean → dedupe → append in DOM order.
+    """
+    url = url.replace('www.reddit.com', 'old.reddit.com')
+    if 'old.reddit.com' not in url:
+        url = 'https://old.reddit.com' + re.sub(r'https?://[^/]+', '', url)
+    fbs, names, dates = [], [], []
+    seen = set()
+
     for page in range(1, 4):
         resp = _fetch(url, timeout=12)
         if not resp: break
         soup = BeautifulSoup(resp.text, 'html.parser')
+
+        # ── post body FIRST (it sits above comments on the page) ──
+        for el in soup.select('div.expando div.md'):
+            raw = el.get_text(' ', strip=True)
+            cl = clean_text(raw)
+            if is_junk(cl) or len(cl) < 80: continue
+            k = cl[:120].lower()
+            if k in seen: continue
+            seen.add(k)
+            fbs.append(cl); names.append(''); dates.append('')
+
+        # ── then comments ──
         for el in soup.select('div.usertext-body div.md'):
             raw = el.get_text(' ', strip=True)
             cl = clean_text(raw)
@@ -1039,46 +1087,72 @@ def scrape_reddit(url: str):
                 a = parent.find('a', class_=re.compile(r'author'))
                 if a: name = a.get_text(strip=True)
             fbs.append(cl); names.append(name); dates.append(_extract_date(el))
-        for el in soup.select('div.expando div.md'):
-            raw = el.get_text(' ', strip=True)
-            cl = clean_text(raw)
-            if not is_junk(cl) and len(cl) > 80:
-                k = cl[:120].lower()
-                if k not in seen: seen.add(k); fbs.append(cl); names.append(''); dates.append('')
+
         nxt = soup.find('a', rel='next')
         if nxt and nxt.get('href'):
             url = nxt['href'] if nxt['href'].startswith('http') else 'https://old.reddit.com' + nxt['href']
-        else: break
+        else:
+            break
         time.sleep(0.5)
+
     return fbs[:200], names[:200], dates[:200], None if fbs else "⚠️ No content found"
 
 
 def scrape_trustpilot(url: str):
+    """
+    Trustpilot scraper — paginated static HTML.
+    Uses current selectors (2024+). Pipeline: clean → dedupe → DataFrame → sort.
+    """
     base = re.sub(r'[?&]page=\d+', '', url).rstrip('/')
-    fbs, names, dates = [], [], []; seen = set()
+    rows = []   # list of dicts — convert to DataFrame at end for clean sort
+    seen = set()
+    page_pos = 0  # global position counter across all pages
+
     for page in range(1, 8):
         page_url = f"{base}?page={page}" if page > 1 else base
         resp = _fetch(page_url, timeout=12)
         if not resp: break
         soup = BeautifulSoup(resp.text, 'html.parser')
-        reviews = soup.select('article[data-service-review-business-unit-display-name], div[class*="reviewCard"], section[class*="review"]')
-        if not reviews: reviews = soup.find_all('article')
+
+        # Try multiple current Trustpilot selectors in order
+        reviews = (soup.select('article[data-service-review-business-unit-display-name]') or
+                   soup.select('div[class*="reviewCard"]') or
+                   soup.select('section[class*="review"]') or
+                   soup.find_all('article'))
         if not reviews: break
+
         new_found = False
         for r in reviews:
-            body = r.find('p', attrs={'data-service-review-text-typography': True}) or \
-                   r.find('p', class_=re.compile(r'typography_body|review-content|reviewText', re.I))
+            # Updated body selectors — Trustpilot changes these periodically
+            body = (r.select_one('[data-service-review-text-typography]') or
+                    r.select_one('[class*="typography_body"]') or
+                    r.select_one('[class*="review_text"]') or
+                    r.select_one('[data-service-review-text]') or
+                    r.find('p'))
             raw = body.get_text(' ', strip=True) if body else r.get_text(' ', strip=True)
             cl = clean_text(raw)
             if is_junk(cl) or len(cl) < 60: continue
             k = cl[:120].lower()
             if k in seen: continue
-            seen.add(k); new_found = True
-            name = _extract_name(r); date = _extract_date(r)
-            fbs.append(cl); names.append(name); dates.append(date)
+            seen.add(k)
+            new_found = True
+            rows.append({
+                'feedback': cl,
+                'name':     _extract_name(r),
+                'date':     _extract_date(r),
+                'pos':      page_pos,
+            })
+            page_pos += 1
+
         if not new_found: break
         time.sleep(0.4)
-    return fbs[:200], names[:200], dates[:200], None if fbs else "⚠️ No reviews found on this Trustpilot page"
+
+    if not rows:
+        return [], [], [], "⚠️ No reviews found on this Trustpilot page"
+
+    # sort → guarantees page 1 row 1 = result row 1
+    df = pd.DataFrame(rows).sort_values('pos').reset_index(drop=True)
+    return df['feedback'].tolist()[:200], df['name'].tolist()[:200], df['date'].tolist()[:200], None
 
 
 def scrape_amazon(url: str):
@@ -1117,63 +1191,125 @@ def scrape_amazon(url: str):
 
 
 def scrape_tripadvisor(url: str):
+    """
+    TripAdvisor scraper — JSON-LD + paginated HTML.
+    Key fix: JSON-LD reviews and HTML blocks share ONE global_pos counter
+    so they sort together correctly instead of JSON-LD always coming first.
+    Pipeline: clean → dedupe → rows list → DataFrame → sort_values → return.
+    """
     base = re.sub(r'-or\d+\.html', '.html', url)
-    fbs, names, dates = [], [], []; seen = set()
+    rows = []
+    seen = set()
+    global_pos = 0  # shared across JSON-LD and HTML — this is the ordering fix
+
     for page in range(0, 6):
         offset = page * 10
-        if page == 0: page_url = base
+        if page == 0:
+            page_url = base
         else:
             page_url = re.sub(r'\.html$', f'-or{offset}.html', base)
-            if '-or' not in page_url: page_url = base.replace('.html', f'-or{offset}.html')
+            if '-or' not in page_url:
+                page_url = base.replace('.html', f'-or{offset}.html')
+
         resp = _fetch(page_url, timeout=15, mobile=False)
         if not resp: break
         soup = BeautifulSoup(resp.text, 'html.parser')
+        found_anything = False
+
+        # JSON-LD reviews (share same pos counter as HTML blocks below)
         for script in soup.find_all('script', type='application/ld+json'):
             try:
                 data = json.loads(script.string or '')
                 items = data if isinstance(data, list) else [data]
                 for item in items:
-                    for rev in item.get('review', []) or item.get('reviews', []):
-                        body = rev.get('reviewBody','') or rev.get('description','')
-                        if body and len(body) > 60:
-                            cl = clean_text(body); k = cl[:120].lower()
-                            if k not in seen:
-                                seen.add(k)
-                                author = rev.get('author',{})
-                                name = author.get('name','') if isinstance(author,dict) else str(author)
-                                fbs.append(cl); names.append(name); dates.append(rev.get('datePublished',''))
+                    for rev in (item.get('review', []) or item.get('reviews', [])):
+                        body = rev.get('reviewBody', '') or rev.get('description', '')
+                        if not body or len(body) < 60: continue
+                        cl = clean_text(body)
+                        k = cl[:120].lower()
+                        if k in seen: continue
+                        seen.add(k)
+                        author = rev.get('author', {})
+                        name = author.get('name', '') if isinstance(author, dict) else str(author)
+                        rows.append({'feedback': cl, 'name': name,
+                                     'date': rev.get('datePublished', ''), 'pos': global_pos})
+                        global_pos += 1
+                        found_anything = True
             except: pass
+
+        # HTML blocks — same counter continues from where JSON-LD left off
         blocks = extract_blocks_generic(soup, min_len=80)
         for b in blocks:
             k = b['text'][:120].lower()
-            if k not in seen: seen.add(k); fbs.append(b['text']); names.append(b['name']); dates.append(b['date'])
-        if not blocks and not any(s.find('script',type='application/ld+json') for s in [soup]): break
+            if k in seen: continue
+            seen.add(k)
+            rows.append({'feedback': b['text'], 'name': b['name'],
+                         'date': b['date'], 'pos': global_pos})
+            global_pos += 1
+            found_anything = True
+
+        if not found_anything: break
         time.sleep(0.5)
-    return fbs[:200], names[:200], dates[:200], None if fbs else "⚠️ TripAdvisor page returned no reviews"
+
+    if not rows:
+        return [], [], [], "⚠️ TripAdvisor page returned no reviews"
+
+    # sort by pos — merges JSON-LD and HTML into correct page order
+    df = pd.DataFrame(rows).sort_values('pos').reset_index(drop=True)
+    return df['feedback'].tolist()[:200], df['name'].tolist()[:200], df['date'].tolist()[:200], None
 
 
 def scrape_zomato(url: str):
-    fbs, names, dates = [], [], []; seen = set()
+    """
+    Zomato scraper — internal JSON API + mobile web fallback.
+    Fix: safe iteration over all sections instead of hardcoded sections[0].
+    Pipeline: clean → dedupe → rows list → DataFrame → sort_values → return.
+    """
+    rows = []
+    seen = set()
+    global_pos = 0
+
     res_id_m = re.search(r'\.com/[^/]+/[^/]+-(\d+)(?:/|$)', url)
     if res_id_m:
         res_id = res_id_m.group(1)
-        api_url = f"https://www.zomato.com/webroutes/getPage?page_url=/restaurant/{res_id}/reviews&location=&isMobile=1"
+        api_url = (f"https://www.zomato.com/webroutes/getPage"
+                   f"?page_url=/restaurant/{res_id}/reviews&location=&isMobile=1")
         resp = _fetch(api_url, timeout=12, mobile=True)
         if resp:
             try:
                 data = resp.json()
-                reviews = data.get('page', {}).get('sections', [{}])[0].get('reviewsList', {}).get('reviewsList', [])
-                if not reviews:
+                # safe: iterate ALL sections, don't hardcode [0]
+                sections = data.get('page', {}).get('sections', [])
+                api_reviews = []
+                for sec in sections:
+                    rl = sec.get('reviewsList', {})
+                    if isinstance(rl, dict):
+                        found = rl.get('reviewsList', [])
+                        if found:
+                            api_reviews = found
+                            break
+                for rev in api_reviews:
+                    body = rev.get('reviewText', '') or rev.get('text', '')
+                    if not body or len(body) < 60: continue
+                    cl = clean_text(body)
+                    k = cl[:120].lower()
+                    if k in seen: continue
+                    seen.add(k)
+                    rows.append({'feedback': cl, 'name': rev.get('reviewerName', ''),
+                                 'date': '', 'pos': global_pos})
+                    global_pos += 1
+                # fallback: JSON mining if structured API returned nothing
+                if not api_reviews:
                     for b in json_mine(resp.text):
                         k = b['text'][:120].lower()
-                        if k not in seen: seen.add(k); fbs.append(b['text']); names.append(''); dates.append('')
-                for rev in reviews:
-                    body = rev.get('reviewText','') or rev.get('text','')
-                    if body and len(body) > 60:
-                        cl = clean_text(body); k = cl[:120].lower()
-                        if k not in seen: seen.add(k); fbs.append(cl); names.append(rev.get('reviewerName','')); dates.append('')
+                        if k in seen: continue
+                        seen.add(k)
+                        rows.append({'feedback': b['text'], 'name': '', 'date': '', 'pos': global_pos})
+                        global_pos += 1
             except: pass
-    if not fbs:
+
+    # Mobile web fallback
+    if not rows:
         mob = url + ('?reviews&page=1' if '?' not in url else '&page=1')
         for page in range(1, 4):
             resp = _fetch(mob, timeout=12, mobile=True)
@@ -1182,13 +1318,25 @@ def scrape_zomato(url: str):
             blocks = extract_blocks_generic(soup, 80)
             for b in blocks:
                 k = b['text'][:120].lower()
-                if k not in seen: seen.add(k); fbs.append(b['text']); names.append(b['name']); dates.append(b['date'])
+                if k in seen: continue
+                seen.add(k)
+                rows.append({'feedback': b['text'], 'name': b['name'],
+                             'date': b['date'], 'pos': global_pos})
+                global_pos += 1
             for b in json_mine(resp.text):
                 k = b['text'][:120].lower()
-                if k not in seen: seen.add(k); fbs.append(b['text']); names.append(''); dates.append('')
+                if k in seen: continue
+                seen.add(k)
+                rows.append({'feedback': b['text'], 'name': '', 'date': '', 'pos': global_pos})
+                global_pos += 1
             if not blocks: break
             time.sleep(0.4)
-    return fbs[:200], names[:200], dates[:200], None if fbs else "⚠️ Zomato page returned no reviews (may require login)"
+
+    if not rows:
+        return [], [], [], "⚠️ Zomato page returned no reviews (may require login)"
+
+    df = pd.DataFrame(rows).sort_values('pos').reset_index(drop=True)
+    return df['feedback'].tolist()[:200], df['name'].tolist()[:200], df['date'].tolist()[:200], None
 
 
 def scrape_glassdoor(url: str):
@@ -1212,36 +1360,64 @@ def scrape_glassdoor(url: str):
 
 
 def scrape_generic(url: str, max_pages=5):
-    domain = re.sub(r'https?://(www\.)?','', url).split('/')[0].lower()
+    """
+    Generic multi-page BS4 scraper.
+    Pipeline: clean → dedupe → rows list → DataFrame → sort_values('pos') → return.
+    pos = global counter across all pages so page 1 row 1 always = result row 1.
+    """
+    domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0].lower()
     base = re.sub(r'[?&]page=\d+|[?&]start=\d+', '', url).rstrip('/')
-    current = url; fbs, names, dates = [], [], []; seen = set(); err = None
-    for page in range(1, max_pages+1):
+    current = url
+    rows = []
+    seen = set()
+    err = None
+    global_pos = 0
+
+    for page in range(1, max_pages + 1):
         resp = _fetch(current, timeout=12)
         if not resp:
             err = "🚫 Site blocked or unreachable"; break
+
         soup = BeautifulSoup(resp.text, 'html.parser')
         blocks = extract_blocks_generic(soup, 80)
-        new = [b for b in blocks if b['text'][:120].lower() not in seen]
-        if not new: break
-        for b in new:
+        new_blocks = [b for b in blocks if b['text'][:120].lower() not in seen]
+
+        if not new_blocks: break
+
+        for b in new_blocks:
             seen.add(b['text'][:120].lower())
-            fbs.append(b['text']); names.append(b['name']); dates.append(b['date'])
+            rows.append({'feedback': b['text'], 'name': b['name'],
+                         'date': b['date'], 'pos': global_pos})
+            global_pos += 1
+
         nxt = soup.find('a', rel='next') or soup.find('a', class_=re.compile(r'\bnext\b', re.I))
         if nxt and nxt.get('href'):
             h = nxt['href']
             current = h if h.startswith('http') else f"https://{domain}{h}"
         else:
             sep = '&' if '?' in base else '?'
-            current = f"{base}{sep}page={page+1}"
+            current = f"{base}{sep}page={page + 1}"
         time.sleep(0.4)
-    if not fbs and not err:
+
+    # JSON mining fallback
+    if not rows and not err:
         resp = _fetch(url, timeout=12)
         if resp:
             for b in json_mine(resp.text):
                 k = b['text'][:120].lower()
-                if k not in seen: seen.add(k); fbs.append(b['text']); names.append(''); dates.append('')
-        if not fbs: err = "⚠️ No feedback text found. Site may require login or use heavy JavaScript."
-    return fbs[:200], names[:200], dates[:200], err
+                if k in seen: continue
+                seen.add(k)
+                rows.append({'feedback': b['text'], 'name': '', 'date': '', 'pos': global_pos})
+                global_pos += 1
+        if not rows:
+            err = "⚠️ No feedback text found. Site may require login or use heavy JavaScript."
+
+    if not rows:
+        return [], [], [], err
+
+    # sort by pos — guarantees page 1 review 1 = row 1
+    df = pd.DataFrame(rows).sort_values('pos').reset_index(drop=True)
+    return df['feedback'].tolist()[:200], df['name'].tolist()[:200], df['date'].tolist()[:200], err
 
 
 def scrape_url(url: str):
@@ -1673,39 +1849,23 @@ with tab2:
                     clean_d   = [it['date']     for it in clean_items]
                     clean_s   = [it['source']   for it in clean_items]
 
-                    fd = pd.DataFrame({
-                        'Feedback':      clean_fb,
-                        '_s':            clean_s,
-                        'Reviewer_Name': clean_n,
-                        '_d':            clean_d,
-                        '_orig_pos':     list(range(len(clean_items))),
-                    })
-                    fd['_c'] = fd['Feedback'].apply(preprocess)
-                    fd = fd[fd['_c'].str.strip() != '']
-                    # Sort by original position after NLP filter
-                    fd = fd.sort_values('_orig_pos').reset_index(drop=True)
+                    # Route through build_results so the full
+                    # clean → dedupe → convert → sort pipeline runs once.
+                    # Source column added after since build_results takes one src string.
+                    # We handle multi-source by passing the most common source label
+                    # and then overwriting with the per-item source list.
+                    with st.spinner("Analyzing..."):
+                        results = build_results(clean_fb, clean_s[0] if clean_s else 'Web',
+                                                clean_n, clean_d, mode='full')
 
-                    if fd.empty:
+                    if results.empty:
                         st.error("❌ No processable feedback after cleaning.")
                     else:
-                        fd['TopicID'] = topic_model(fd['_c'].tolist())
-                        fd['Topic'] = fd['TopicID'].map(TOPIC_LABELS)
-                        ai_names, sugs, sents = run_ai_analysis(fd, mode='full')
-                        final_names = []
-                        for scraped, ai_nm in zip(fd['Reviewer_Name'].tolist(), ai_names):
-                            if scraped and str(scraped).strip() and scraped not in ('nan','None',''): final_names.append(str(scraped).strip())
-                            elif ai_nm and str(ai_nm).strip(): final_names.append(str(ai_nm).strip())
-                            else: final_names.append('')
-                        fd['Reviewer_Name'] = final_names
-                        fd['Suggestion'] = [
-                            s.strip() if s and isinstance(s, str) and len(s.strip()) > 20
-                            else generate_fallback_suggestion(f, t)
-                            for s, t, f in zip(sugs, fd['TopicID'], fd['Feedback'])
-                        ]
-                        fd['Sentiment'] = sents
-                        results = fd.rename(columns={'_s': 'Source', '_d': 'Feedback_Date'})[
-                            ['Source','Reviewer_Name','Feedback_Date','Feedback','Topic','Sentiment','Suggestion']]
-                        results = assign_ids(results)
+                        # Restore correct per-row source labels in original order
+                        if len(clean_s) == len(results):
+                            results['Source'] = clean_s
+                        results = assign_ids(results[['Source','Reviewer_Name','Feedback_Date',
+                                                       'Feedback','Topic','Sentiment','Suggestion']])
                         st.session_state.results_df = results; st.session_state.analyzed = True
                         src_label = ", ".join(dict.fromkeys(clean_s))
                         saved, skipped = save_entries(sid, results)
