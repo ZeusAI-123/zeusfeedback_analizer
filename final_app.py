@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import tempfile
 import re, os, sqlite3, uuid, time, io, hashlib, json
 from datetime import datetime
 # import openai
@@ -477,11 +478,17 @@ init_db()
 
 def render_step_bar(current_step, steps):
     html = '<div class="step-bar">'
+    
     for i, label in enumerate(steps, 1):
-        if i < current_step: css, prefix = "step-item step-done", "✓ "
-        elif i == current_step: css, prefix = "step-item step-active", ""
-        else: css, prefix = "step-item step-pending", ""
-        html += f'<div class="{css}">{prefix}{label}</div>'
+        if i < current_step:
+            css, prefix = "step-item step-done", "✓ "
+        elif i == current_step:
+            css, prefix = "step-item step-active", ""
+        else:
+            css, prefix = "step-item step-pending", ""
+
+        html += f'<div class="{css}">{prefix}{i}. {label}</div>'
+
     html += '</div>'
     st.markdown(html, unsafe_allow_html=True)
 
@@ -2031,16 +2038,16 @@ st.markdown(
 )
 
 # ── Analyst name input (inline, below hero) ────────────────
-_uname_col, _ = st.columns([2, 5])
-with _uname_col:
-    _typed_name = st.text_input(
-        "👤 Analyst Name",
-        value=st.session_state.user_name,
-        placeholder="e.g. Priya",
-        key="analyst_name_input",
-    )
-    if _typed_name:
-        st.session_state.user_name = _typed_name
+# _uname_col, _ = st.columns([2, 5])
+# with _uname_col:
+#     _typed_name = st.text_input(
+#         "👤 Analyst Name",
+#         value=st.session_state.user_name,
+#         placeholder="e.g. Priya",
+#         key="analyst_name_input",
+#     )
+#     if _typed_name:
+#         st.session_state.user_name = _typed_name
 
 # ══ TABS ═══════════════════════════════════════════════════
 tab_csv, tab_url, tab_db, tab_results, tab_history = st.tabs([
@@ -2085,11 +2092,21 @@ with tab_csv:
             ).tolist()
 
             ac = ['(None)'] + list(df_raw.columns)
-            cn, cd = st.columns(2)
+            us, cn, cd = st.columns(3)
+            with us:
+                _typed_name = st.text_input(
+                    "👤 Analyst Name",
+                    value=st.session_state.user_name,
+                    placeholder="e.g. Priya",
+                    key="analyst_name_input",
+                )
+                if _typed_name:
+                    st.session_state.user_name = _typed_name
             with cn:
                 name_col = st.selectbox("Reviewer Name column (optional)", ac, index=0)
             with cd:
                 date_col = st.selectbox("Date column (optional)", ac, index=0)
+            
 
             st.dataframe(df_raw.head(5), use_container_width=True)
             notes = st.text_input("Session notes (optional)", placeholder="e.g. Q2 2025 product feedback")
@@ -2149,8 +2166,8 @@ with tab_url:
 
 # ══ TAB 3 — Database Connection ════════════════════════════
 with tab_db:
-        STEPS = ["1 · Configure & Connect", "2 · Select, Detect & Analyze"]
-        render_step_bar(st.session_state.db_step, STEPS)
+        # STEPS = ["Configure & Connect", "Select, Detect & Analyze"]
+        # render_step_bar(st.session_state.db_step, STEPS)
 
         # ──────────────────────── STEP 1 ─────────────────────────────────────
         if st.session_state.db_step == 1:
@@ -2266,7 +2283,7 @@ with tab_db:
 
                         if db_type == "SQLite (file)":
                             if not conn_params.get("file"): st.error("❌ Upload a SQLite file first."); st.stop()
-                            tmp = f"/tmp/zeus_{uuid.uuid4().hex[:8]}.db"
+                            tmp = os.path.join(tempfile.gettempdir(), f"zeus_{uuid.uuid4().hex[:8]}.db")
                             with open(tmp,"wb") as fh: fh.write(conn_params["file"].read())
                             st.session_state.db_tmp_path = tmp
                             tables = _list_sqlite_tables(tmp); src_label = "SQLite"
@@ -2684,7 +2701,7 @@ with tab_db:
     #             )
     #             if st.button("📋 List Tables", key="sqlite_tables_btn"):
     #                 try:
-    #                     import tempfile
+    #                     
     #                     with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
     #                         tmp.write(sqlite_file.read())
     #                         tmp_path = tmp.name
