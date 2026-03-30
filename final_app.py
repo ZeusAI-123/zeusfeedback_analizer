@@ -1872,6 +1872,11 @@ def combine_sentiment(sentiments):
     
 from collections import defaultdict
 
+def get_all_sessions():
+    conn=sqlite3.connect(DB_PATH)
+    df=pd.read_sql_query("SELECT session_id,user_name,created_date,created_time,source_type,total_entries,notes FROM sessions ORDER BY created_at DESC",conn)
+    conn.close(); return df
+
 def combine_suggestions(departments, suggestions):
     dept_map = defaultdict(list)
 
