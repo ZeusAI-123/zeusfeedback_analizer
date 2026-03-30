@@ -66,8 +66,9 @@ except ImportError:
 env_path = r"F:\Zeus AI\zeusfeedback_analizer\.env"
 load_dotenv(env_path)
 
-
+api_key = "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"
 client = OpenAI(api_key=api_key)
+
 
 # st.write("ENV PATH:", env_path)
 # st.write("API KEY LOADED:", api_key)
@@ -1772,6 +1773,25 @@ For each item:
 Format EXACTLY:
 1. [Sentiment] [Department]:[Suggestion]
 2. [Sentiment] [Department]:[Suggestion]
+
+STRICT RULES (MANDATORY):
+
+- Suggestion MUST be directly derived from the feedback text
+- DO NOT add new ideas, strategies, or assumptions
+- DO NOT generalize beyond what is explicitly mentioned
+- If the issue is not mentioned → DO NOT create suggestion
+- Use the SAME context and wording as feedback
+- Keep suggestion under 15 words
+- Maximum 1 short sentence per item
+
+VALID EXAMPLE:
+Feedback: "Staff was rude"
+✔ Train staff to be polite
+
+INVALID EXAMPLE:
+Feedback: "Food was good"
+❌ Introduce loyalty programs
+❌ Expand menu variety
 """
 
     for i, p in enumerate(parts, 1):
@@ -1782,9 +1802,11 @@ Format EXACTLY:
         messages=[
             {"role": "system", "content": "You are a CX expert."},
             {"role": "user", "content": prompt}
+
         ],
-        temperature=0.3
-    )
+        temperature=0.2,
+        max_tokens=300,
+        )
 
     return resp.choices[0].message.content
 
@@ -1940,15 +1962,20 @@ def generate_future_action_plan(suggestions_list):
 You are a CX strategist.
 
 Based on the following operational suggestions, create a FUTURE CUSTOMER ACTION PLAN.
+Department responsible (choose best fit: Management, Operations, Kitchen, Service, HR, Training, Technology, Marketing, Facilities, etc.)
 
-Rules:
-- Focus on preventing these issues for future customers
-- Convert suggestions into forward-looking actions
-- DO NOT use markdown (**)
-- DO NOT use numbering (1,2,3)
-- Write in clean plain sentences or bullet points using "-"
-- Keep it concise (3–5 lines)
-- Group logically if needed
+Format:
+Department Responsible [Suggestion]
+
+STRICT RULES (MANDATORY):
+- Maximum 5 lines ONLY
+- Each line MUST be under 12 words
+- One short sentence per line
+- DO NOT repeat similar actions
+- DO NOT expand or explain
+- DO NOT add new ideas beyond input
+- Merge similar points into one concise action
+- Use simple, direct language
 
 Suggestions:
 {sug}
@@ -2731,9 +2758,9 @@ with tab1:
         unsafe_allow_html=True,
     )
 
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c3, c4, c5 = st.columns(4)
     c1.metric("Total Entries", f"{total:,}")
-    c2.metric("Topics", df['Topic'].nunique())
+    # c2.metric("Topics", df['Topic'].nunique())
     c3.metric("Sources", df['Source'].nunique())
     named = (
         df['Reviewer_Name'].astype(str).str.strip().ne('').sum()
@@ -2743,19 +2770,19 @@ with tab1:
     pos = df['Sentiment'].eq('Positive').sum() if 'Sentiment' in df.columns else 0
     c5.metric("Positive", pos)
 
-    st.divider()
-    st.markdown("### 🗂️ Topic Distribution")
+    # st.divider()
+    # st.markdown("### 🗂️ Topic Distribution")
     cols = st.columns(min(len(tc), 5))
-    for i, (topic, count) in enumerate(tc.items()):
-        with cols[i % 5]:
-            st.markdown(f"""
-            <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
-                        border-radius:12px;padding:1rem;text-align:center;">
-                <div style="font-size:1.6rem;font-weight:800;color:#f9a825;
-                            font-family:'Space Mono',monospace;">{count}</div>
-                <div style="font-size:0.68rem;color:#aaa;margin:4px 0;">{topic}</div>
-                <div style="font-size:0.75rem;color:#666;">{round(count / total * 100)}%</div>
-            </div>""", unsafe_allow_html=True)
+    # for i, (topic, count) in enumerate(tc.items()):
+    #     with cols[i % 5]:
+    #         st.markdown(f"""
+    #         <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
+    #                     border-radius:12px;padding:1rem;text-align:center;">
+    #             <div style="font-size:1.6rem;font-weight:800;color:#f9a825;
+    #                         font-family:'Space Mono',monospace;">{count}</div>
+    #             <div style="font-size:0.68rem;color:#aaa;margin:4px 0;">{topic}</div>
+    #             <div style="font-size:0.75rem;color:#666;">{round(count / total * 100)}%</div>
+    #         </div>""", unsafe_allow_html=True)
 
     st.divider()
     st.markdown("### 🔍 Browse & Filter")
@@ -2782,7 +2809,7 @@ with tab1:
     if view == "📋 Table":
         dcols = [
             c for c in
-            ['Feedback_ID', 'Source', 'Reviewer_Name', 'Feedback_Date', 'Feedback', 'Topic', 'Sentiment', 'Suggestion','Future_Action_Plan']
+            ['Feedback_ID', 'Source', 'Reviewer_Name', 'Feedback_Date', 'Feedback', 'Sentiment', 'Suggestion','Future_Action_Plan']
             if c in filtered.columns
         ]
         st.dataframe(
@@ -2794,7 +2821,7 @@ with tab1:
                 "Feedback":    st.column_config.TextColumn("Feedback",    width="large"),
                 "Suggestion":  st.column_config.TextColumn("AI Suggestion", width="large"),
                 "Sentiment":   st.column_config.TextColumn("Sentiment",  width="small"),
-                "Topic":       st.column_config.TextColumn("Topic",      width="medium"),
+                # "Topic":       st.column_config.TextColumn("Topic",      width="medium"),
                 "Reviewer_Name": st.column_config.TextColumn("Reviewer", width="small"),
                 "Feedback_Date": st.column_config.TextColumn("Date",     width="small"),
                 "Future_Action_Plan": st.column_config.TextColumn("Future Action Plan", width="large"),
