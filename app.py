@@ -63,6 +63,7 @@ try:
 except ImportError:
     DATABRICKS_AVAILABLE = False
 
+load_dotenv()
 client = OpenAI(api_key=OPEN_API_KEY)
 
 
