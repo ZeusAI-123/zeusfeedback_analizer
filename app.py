@@ -64,7 +64,8 @@ except ImportError:
     DATABRICKS_AVAILABLE = False
 
 load_dotenv()
-client = OpenAI(api_key=OPEN_API_KEY)
+# OPEN_API_KEY = st.secrets(OPEN_API_KEY)
+client = OpenAI(api_key=st.secrets["OPEN_API_KEY"])
 
 
 # st.write("ENV PATH:", env_path)
