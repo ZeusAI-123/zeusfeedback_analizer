@@ -1769,37 +1769,51 @@ def analyze_feedback_parts(feedback):
     # st.write(parts)
 
     prompt = """
-Analyze each feedback part.
+Analyze each feedback item independently.
 
-For each item:
+For EACH item:
 1. Sentiment (Positive / Negative / Neutral)
-2. Department responsible (choose best fit: Management, Operations, Kitchen, Service, HR, Training, Technology, Marketing, Facilities, etc.)
-3. One actionable business recommendation
+2. Department responsible (best fit only)
+3. ONE actionable suggestion strictly based on the feedback
 
-Format EXACTLY:
-1. [Sentiment] [Department]:[Suggestion]
-2. [Sentiment] [Department]:[Suggestion]
+OUTPUT FORMAT (STRICT):
+1. [Sentiment] [Department]: Suggestion
+2. [Sentiment] [Department]: Suggestion
 
-STRICT RULES (MANDATORY):
+MANDATORY RULES:
+
+- DO NOT skip any feedback item
+- DO NOT merge multiple feedbacks into one
+- Each feedback must produce exactly ONE line
 
 - Suggestion MUST be directly derived from the feedback text
-- Focus on the PATTERN hidden in the feedback — what process, team, or system is failing?
-- Suggestion MUST be actionable and specific to that issue
-- DO NOT add new ideas, strategies, or assumptions
-- DO NOT generalize beyond what is explicitly mentioned
-- If the issue is not mentioned → DO NOT create suggestion
-- Use the SAME context and wording as feedback
-- Keep suggestion under 15 words
-- Maximum 1 short sentence per item
+- DO NOT infer or assume anything not explicitly mentioned
+- DO NOT add new ideas, strategies, or improvements beyond the issue
 
-VALID EXAMPLE:
-Feedback: "Staff was rude"
-✔ Train staff to be polite
+- Identify the ROOT ISSUE clearly from the feedback
+- Suggestion must directly fix that exact issue only
 
-INVALID EXAMPLE:
-Feedback: "Food was good"
-❌ Introduce loyalty programs
-❌ Expand menu variety
+- Keep suggestion SHORT (max 12 words)
+- Only ONE sentence per item
+- NO semicolons
+- NO extra explanations
+- NO repetition of feedback text
+
+- Use simple, direct action verbs (Fix, Improve, Train, Clean, Reduce, Increase, etc.)
+
+VALID:
+Feedback: "Service was slow"
+✔ Improve service speed during peak hours
+
+INVALID:
+❌ Improve overall customer experience
+❌ Introduce new service strategy
+❌ Multiple sentences or long explanations
+❌ Using semicolons
+
+IMPORTANT:
+- Output must be clean, minimal, and consistent
+- Do not include anything except the formatted lines
 """
 
     for i, p in enumerate(parts, 1):
