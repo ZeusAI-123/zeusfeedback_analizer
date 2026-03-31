@@ -1797,7 +1797,7 @@ CONTENT RULES (MANDATORY):
   - Be under 10 words
   - Be one sentence only
   - Start with an action verb
-  - Contain NO semicolons
+  - Use fullstop instead of semicolons 
   - Contain NO filler words
 
 STRICTLY AVOID:
@@ -1806,6 +1806,7 @@ STRICTLY AVOID:
 - Rewriting feedback
 - Adding business strategies
 - Guessing hidden problems
+- Semicolons instead use fullstop
 
 EXAMPLES:
 
