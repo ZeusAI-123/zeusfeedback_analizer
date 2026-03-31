@@ -2013,7 +2013,7 @@ MANDATORY RULES:
 - MAXIMUM 5 lines ONLY (hard limit)
 - Each line under 12 words
 - One sentence per line
-- No brackets, no semicolons
+- No brackets
 
 CRITICAL RULES:
 
@@ -2039,7 +2039,7 @@ Service [Staff friendly]
 Service [Staff polite]
 
 Output:
-1. Service Maintain friendly and polite staff behavior
+1. Service:Maintain friendly and polite staff behavior
 
 Suggestions:
 {sug}
