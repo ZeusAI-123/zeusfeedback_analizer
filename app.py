@@ -2003,7 +2003,7 @@ def generate_future_action_plan(suggestions_list):
 Convert the suggestions into a concise FUTURE CUSTOMER ACTION PLAN.
 
 INPUT FORMAT:
-Department [Suggestion]
+Department : [Suggestion]
 
 OUTPUT FORMAT (STRICT):
 1. Department Action sentence
