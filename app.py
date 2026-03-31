@@ -1783,6 +1783,8 @@ Format EXACTLY:
 STRICT RULES (MANDATORY):
 
 - Suggestion MUST be directly derived from the feedback text
+- Focus on the PATTERN hidden in the feedback — what process, team, or system is failing?
+- Suggestion MUST be actionable and specific to that issue
 - DO NOT add new ideas, strategies, or assumptions
 - DO NOT generalize beyond what is explicitly mentioned
 - If the issue is not mentioned → DO NOT create suggestion
