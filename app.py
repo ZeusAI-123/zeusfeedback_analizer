@@ -63,12 +63,7 @@ try:
 except ImportError:
     DATABRICKS_AVAILABLE = False
 
-
-env_path = r"F:\Zeus AI\zeusfeedback_analizer\.env"
-load_dotenv(env_path)
-
-api_key = "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"
-client = OpenAI(api_key=api_key)
+client = OpenAI(api_key=OPEN_API_KEY)
 
 
 # st.write("ENV PATH:", env_path)
