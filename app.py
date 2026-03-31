@@ -1997,51 +1997,55 @@ def generate_future_action_plan(suggestions_list):
 
     for sug in suggestions_list:
         try:
-            prompt = f"""You are a CX strategist.
+            prompt = f"""
+            You are a CX strategist.
 
-Convert the given suggestions into a FUTURE CUSTOMER ACTION PLAN.
+Convert the suggestions into a concise FUTURE CUSTOMER ACTION PLAN.
 
 INPUT FORMAT:
 Department [Suggestion]
 
 OUTPUT FORMAT (STRICT):
-1. [Department] Action sentence
-2. [Department] Action sentence
+1. Department Action sentence
 
 MANDATORY RULES:
 
-- Convert each suggestion into a clear ACTION (not a phrase)
-- DO NOT copy input format or brackets
-- DO NOT repeat suggestion wording exactly
-
-- Each line must:
-  - Start with the Department
-  - Be a complete action sentence
-  - Use a strong action verb (Improve, Ensure, Provide, Maintain)
-
-- Maximum 5 lines only
+- MAXIMUM 5 lines ONLY (hard limit)
 - Each line under 12 words
-- No semicolons
-- No brackets in output
-- No explanations
+- One sentence per line
+- No brackets, no semicolons
 
-- DO NOT add new ideas
-- DO NOT merge unrelated suggestions
-- Keep meaning EXACTLY same as input
+CRITICAL RULES:
+
+- MERGE similar or repeated suggestions into ONE action
+- REMOVE duplicates and overlapping meaning
+- Keep only the MOST IMPORTANT actions
+
+- DO NOT repeat same department multiple times unless necessary
+- Prefer combining into one strong sentence per department
+
+- Suggestion must:
+  - Be action-oriented
+  - Use simple wording
+  - Keep original meaning only (no new ideas)
+
+- DO NOT list everything
+- SELECT and COMPRESS into top 5 unique actions
 
 EXAMPLE:
 
 Input:
-Kitchen [Improve vegetarian food options]
+Service [Staff friendly]
+Service [Staff polite]
 
 Output:
-1. Kitchen Improve vegetarian food options
+1. Service Maintain friendly and polite staff behavior
 
 Suggestions:
 {sug}
 
 Output:
-Only the action plan.
+Only the final 5-line action plan.
 """
 
             resp = client.chat.completions.create(
