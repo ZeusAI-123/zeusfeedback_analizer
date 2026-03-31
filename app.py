@@ -1769,51 +1769,63 @@ def analyze_feedback_parts(feedback):
     # st.write(parts)
 
     prompt = """
-Analyze each feedback item independently.
+You are analyzing customer feedback.
 
-For EACH item:
-1. Sentiment (Positive / Negative / Neutral)
-2. Department responsible (best fit only)
-3. ONE actionable suggestion strictly based on the feedback
+Process EACH feedback item separately and do not skip any.
 
-OUTPUT FORMAT (STRICT):
-1. [Sentiment] [Department]: Suggestion
-2. [Sentiment] [Department]: Suggestion
+For every item, output:
+[Sentiment] [Department]: Suggestion
 
-MANDATORY RULES:
+FORMAT RULES (STRICT):
+- Number each line (1, 2, 3…)
+- Exactly ONE line per feedback
+- No extra text before or after output
 
-- DO NOT skip any feedback item
-- DO NOT merge multiple feedbacks into one
-- Each feedback must produce exactly ONE line
+CONTENT RULES (MANDATORY):
 
-- Suggestion MUST be directly derived from the feedback text
-- DO NOT infer or assume anything not explicitly mentioned
-- DO NOT add new ideas, strategies, or improvements beyond the issue
+- Sentiment must be only: Positive, Negative, or Neutral
+- Department must be the closest direct owner of the issue
 
-- Identify the ROOT ISSUE clearly from the feedback
-- Suggestion must directly fix that exact issue only
+- Suggestion MUST directly fix what is explicitly mentioned
+- DO NOT assume causes not written in feedback
+- DO NOT generalize or add improvements not mentioned
 
-- Keep suggestion SHORT (max 12 words)
-- Only ONE sentence per item
-- NO semicolons
-- NO extra explanations
-- NO repetition of feedback text
+- If feedback mentions multiple issues:
+  → Focus only on the MOST CLEAR issue
 
-- Use simple, direct action verbs (Fix, Improve, Train, Clean, Reduce, Increase, etc.)
+- Suggestion must:
+  - Be under 10 words
+  - Be one sentence only
+  - Start with an action verb
+  - Contain NO semicolons
+  - Contain NO filler words
 
-VALID:
-Feedback: "Service was slow"
-✔ Improve service speed during peak hours
+STRICTLY AVOID:
+- Combining feedbacks
+- Long explanations
+- Rewriting feedback
+- Adding business strategies
+- Guessing hidden problems
 
-INVALID:
-❌ Improve overall customer experience
-❌ Introduce new service strategy
-❌ Multiple sentences or long explanations
-❌ Using semicolons
+EXAMPLES:
 
-IMPORTANT:
-- Output must be clean, minimal, and consistent
-- Do not include anything except the formatted lines
+Feedback: "Food was cold"
+✔ 1. Negative Kitchen: Serve food hot
+
+Feedback: "Staff was helpful"
+✔ 1. Positive Service: Maintain helpful staff behavior
+
+Feedback: "Waiting time too long"
+✔ 1. Negative Operations: Reduce waiting time
+
+FINAL CHECK BEFORE OUTPUT:
+- Did you cover ALL feedback items
+- Is each line under 10 words
+- Is suggestion directly tied to feedback
+- No semicolons used
+- No extra sentences
+
+Output ONLY the final list.
 """
 
     for i, p in enumerate(parts, 1):
