@@ -1531,7 +1531,7 @@ def render_results_tab(df, sid, uname_val):
         st.dataframe(filtered[dcols], use_container_width=True, height=420,
             column_config={"Feedback_ID":st.column_config.TextColumn("ID",width="small"),
                 "Feedback":st.column_config.TextColumn("Feedback",width="large"),
-                "Suggestion":st.column_config.TextColumn("AI Suggestion",width="large"),
+                "Suggestion":st.column_config.TextColumn("Suggestion",width="large"),
                 "Sentiment":st.column_config.TextColumn("Sentiment",width="small"),
                 "Topic":st.column_config.TextColumn("Topic",width="medium"),
                 "Reviewer_Name":st.column_config.TextColumn("Reviewer",width="small"),
@@ -1559,7 +1559,7 @@ def render_results_tab(df, sid, uname_val):
     {f'<span style="font-family:Space Mono,monospace;font-size:0.68rem;color:#888;">{mh}</span>' if mh else ''}
 </div><div style="color:#ddd;font-size:0.9rem;line-height:1.7;margin-bottom:0.8rem;">{fb_display}{fb_overflow}</div>
 <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:0.8rem;">
-    <span style="font-family:Space Mono,monospace;font-size:0.65rem;color:#f9a825;letter-spacing:2px;text-transform:uppercase;">💡 AI Suggestion</span>
+    <span style="font-family:Space Mono,monospace;font-size:0.65rem;color:#f9a825;letter-spacing:2px;text-transform:uppercase;">💡 Suggestion</span>
     <div style="color:#b0b0b0;font-size:0.85rem;margin-top:4px;">{row.get('Suggestion','')}</div>
 </div></div>""", unsafe_allow_html=True)
         if len(filtered) > 30: st.info(f"Showing 30 cards. Switch to Table for all {len(filtered)}.")
@@ -2895,7 +2895,7 @@ with tab1:
             column_config={
                 "Feedback_ID": st.column_config.TextColumn("ID",          width="small"),
                 "Feedback":    st.column_config.TextColumn("Feedback",    width="large"),
-                "Suggestion":  st.column_config.TextColumn("AI Suggestion", width="large"),
+                "Suggestion":  st.column_config.TextColumn("Suggestion", width="large"),
                 "Sentiment":   st.column_config.TextColumn("Sentiment",  width="small"),
                 # "Topic":       st.column_config.TextColumn("Topic",      width="medium"),
                 "Reviewer_Name": st.column_config.TextColumn("Reviewer", width="small"),
@@ -2935,7 +2935,7 @@ with tab1:
                 </div>
                 <div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:0.8rem;">
                     <span style="font-family:'Space Mono',monospace;font-size:0.65rem;color:#f9a825;
-                                 letter-spacing:2px;text-transform:uppercase;">💡 AI Suggestion</span>
+                                 letter-spacing:2px;text-transform:uppercase;">💡 Suggestion</span>
                     <div style="color:#b0b0b0;font-size:0.85rem;margin-top:4px;">{row.get('Suggestion', '')}</div>
                 </div>
             </div>
