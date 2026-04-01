@@ -1658,7 +1658,8 @@ def make_summary_txt(df, session_id, user_name):
         lines+=[f"\n  [{fid}] [{row['Source']}]  {row['Topic']}",
                 f"  Reviewer   : {name if name else 'Anonymous'}",
                 f"  Date       : {date if date else 'Unknown'}",
-                f"  Feedback   : {row['Feedback'][:300]}",
+                # f"  Feedback   : {row['Feedback'][:300]}",
+                f"  Feedback   : {str(row.get('Feedback', row.get('feedback', '')))[:300]}"
                 f"  Suggestion : {row['Suggestion']}","  "+"·"*65]
     return '\n'.join(lines)
 
